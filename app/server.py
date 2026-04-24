@@ -9,6 +9,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from curl_cffi import requests as curl_requests
 from loguru import logger
 
 from app.config import load_config, get_config
@@ -107,10 +108,65 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Cleanup loop error: {e}")
 
+    async def _auto_register_loop():
+        """Auto-register new accounts when active tokens < min_tokens."""
+        while True:
+            try:
+                interval = get_config("register.register_interval", 60)
+                await asyncio.sleep(interval)
+                auto = get_config("register.auto_register", False)
+                if not auto:
+                    continue
+                min_tokens = get_config("register.min_tokens", 3)
+                if tm.active_count >= min_tokens:
+                    continue
+                need = min_tokens - tm.active_count
+                logger.info(f"Auto-register: {tm.active_count} active < {min_tokens} min, registering {need} account(s)")
+
+                from app.reg_web import register_account, CFEmailProvider, FlowContext, BrowserFingerprint
+
+                cf_url = get_config("register.cf_url", "")
+                cf_auth = get_config("register.cf_auth", "")
+                cf_admin_auth = get_config("register.cf_admin_auth", "")
+                cf_domain = get_config("register.cf_domain", "")
+                reg_proxy = get_config("register.proxy", "") or proxy
+
+                if not cf_url:
+                    logger.warning("Auto-register: cf_url not configured, skipping")
+                    continue
+
+                for i in range(need):
+                    try:
+                        fp = BrowserFingerprint.chrome_windows()
+                        proxies = {"http": reg_proxy, "https": reg_proxy} if reg_proxy else None
+                        session = curl_requests.Session(impersonate=fp.impersonate, proxies=proxies)
+
+                        email_provider = CFEmailProvider(
+                            cf_url=cf_url, cf_auth=cf_auth,
+                            cf_admin_auth=cf_admin_auth, cf_domain=cf_domain,
+                            proxies=proxies,
+                        )
+                        context = FlowContext(
+                            fingerprint=fp,
+                            redirect_uri="https://platform.openai.com/auth/callback",
+                            client_id="app_2SKx67EdpoN0G6j64rFvigXD",
+                        )
+                        token_data = register_account(session, context, email_provider, proxies=proxies)
+                        from app.token_manager import TokenInfo
+                        token = TokenInfo.from_dict(token_data)
+                        tm.add_token(token)
+                        logger.info(f"Auto-register OK: {token.email}")
+                    except Exception as e:
+                        logger.error(f"Auto-register failed ({i+1}/{need}): {e}")
+                    await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"Auto-register loop error: {e}")
+
     tasks.append(asyncio.create_task(_refresh_loop()))
     tasks.append(asyncio.create_task(_cooling_loop()))
     tasks.append(asyncio.create_task(_scan_loop()))
     tasks.append(asyncio.create_task(_cleanup_loop()))
+    tasks.append(asyncio.create_task(_auto_register_loop()))
 
     logger.info(f"gpt2api started: {tm.active_count}/{tm.total_count} active tokens")
 

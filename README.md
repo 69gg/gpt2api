@@ -202,12 +202,13 @@ gpt2api/
 
 ## Token 生命周期
 
-服务启动后自动启动 4 个后台任务：
+服务启动后自动启动 5 个后台任务：
 
 1. **Token 刷新**（默认每 2 小时）：用 `refresh_token` 换取新的 `access_token`
 2. **冷却恢复**（每 10 分钟）：配额耗尽的 token 等待冷却期后恢复 active
 3. **新 Token 扫描**（每 30 秒）：检测 `web_token/` 目录新增的文件
 4. **死 Token 清理**（每小时）：删除超过保留期的 dead token
+5. **自动注册**（每 60 秒检查）：当 `auto_register: true` 且 active token 数 < `min_tokens` 时自动注册新账号
 
 ## 注意事项
 
