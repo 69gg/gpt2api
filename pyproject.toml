@@ -1,0 +1,19 @@
+[project]
+name = "gpt2api"
+version = "1.0.0"
+description = "OpenAI-compatible API backed by ChatGPT Web Chat"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "curl-cffi>=0.7.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "orjson>=3.10",
+    "loguru>=0.7",
+    "aiofiles>=23.0",
+    "watchdog>=4.0",
+]
+
+[tool.uv]
+package = false
