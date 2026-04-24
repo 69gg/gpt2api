@@ -41,7 +41,7 @@ TOKEN_URL = "https://auth.openai.com/oauth/token"
 
 CLIENT_ID_PLATFORM = "app_2SKx67EdpoN0G6j64rFvigXD"
 REDIRECT_URI_PLATFORM = "https://platform.openai.com/auth/callback"
-DEFAULT_SCOPE = "openid email profile offline_access model.request model.read model.compare organization.read organization.write"
+DEFAULT_SCOPE = "openid email profile offline_access"
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.112 Safari/537.36"
 
@@ -321,16 +321,93 @@ class CFEmailProvider:
                     if isinstance(results, list):
                         for mail in results:
                             mid = str(mail.get("id", ""))
-                            if known_ids and mid in known_ids:
+                            if not mid or (known_ids and mid in known_ids):
                                 continue
-                            subject = str(mail.get("subject", ""))
-                            body = str(mail.get("text", "") or mail.get("html", "") or mail.get("raw", "") or "")
-                            code_match = re.search(r'\b(\d{6})\b', subject + " " + body)
-                            if code_match:
-                                return code_match.group(1)
+                            # Fetch mail detail to get raw content
+                            detail = self._get_mail_detail(jwt, mid)
+                            code = self._extract_otp_from_mail(mail, detail)
+                            if code:
+                                return code
             except Exception:
                 pass
             time.sleep(3)
+        return ""
+
+    def _get_mail_detail(self, jwt: str, mail_id: str) -> Dict[str, Any]:
+        url = f"{self.cf_url}/api/mail/{mail_id}"
+        h = self._headers(address_jwt=jwt)
+        try:
+            resp = requests.get(url, headers=h, proxies=self.proxies,
+                                timeout=15, impersonate="chrome136")
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return {}
+
+    @staticmethod
+    def _extract_otp_from_mail(summary: Dict[str, Any], detail: Dict[str, Any]) -> str:
+        # Only extract from OpenAI emails to avoid wrong codes from other mail
+        source = str(summary.get("source") or summary.get("from") or detail.get("source") or detail.get("from") or "")
+        subject = str(summary.get("subject") or detail.get("subject") or "")
+        text = str(summary.get("text") or detail.get("text") or "")
+        html = str(summary.get("html") or detail.get("html") or "")
+        raw = str(detail.get("raw") or summary.get("raw") or "")
+
+        searchable = f"{subject} {text} {html} {source}".strip()
+        # Check if this is an OpenAI email
+        identity_markers = ("openai", "chatgpt", "codex")
+        normalized = searchable.lower()
+        is_oai = any(m in normalized for m in identity_markers)
+        if not is_oai and raw:
+            is_oai = any(m in raw.lower() for m in identity_markers)
+
+        # Try subject first
+        code_match = re.search(r'(?<!\d)(\d{6})(?!\d)', subject)
+        if code_match and is_oai:
+            return code_match.group(1)
+
+        # Parse raw email content
+        if raw:
+            from email.parser import BytesParser
+            from email import policy
+            try:
+                msg = BytesParser(policy=policy.default).parsebytes(raw.encode("utf-8", "replace"))
+                parsed_subject = str(msg.get("subject") or "")
+                # Try parsed subject
+                code_match = re.search(r'(?<!\d)(\d{6})(?!\d)', parsed_subject)
+                if code_match and is_oai:
+                    return code_match.group(1)
+                parts = msg.walk() if msg.is_multipart() else [msg]
+                for part in parts:
+                    if part.is_multipart() or (part.get_content_disposition() or "").lower() == "attachment":
+                        continue
+                    try:
+                        content = part.get_content()
+                        if isinstance(content, bytes):
+                            charset = part.get_content_charset() or "utf-8"
+                            content = content.decode(charset, "replace")
+                        if not content:
+                            continue
+                        content_str = str(content)
+                        # Remove CSS hex colors (#123456) to avoid false matches
+                        cleaned = re.sub(r'#[0-9a-fA-F]{6}\b', '', content_str)
+                        code_match = re.search(r'(?<!\d)(\d{6})(?!\d)', cleaned)
+                        if code_match:
+                            return code_match.group(1)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        # Fallback: try text/html fields from detail (also strip hex colors)
+        if is_oai:
+            for field in ("text", "html"):
+                content = str(detail.get(field, ""))
+                if content:
+                    cleaned = re.sub(r'#[0-9a-fA-F]{6}\b', '', content)
+                    code_match = re.search(r'(?<!\d)(\d{6})(?!\d)', cleaned)
+                    if code_match:
+                        return code_match.group(1)
         return ""
 
 
@@ -434,7 +511,8 @@ def _fetch_sentinel_challenge(session, device_id, flow="authorize_continue", use
     }
     try:
         resp = session.post("https://sentinel.openai.com/backend-api/sentinel/req",
-                            data=json.dumps(body), headers=headers, timeout=20)
+                            data=json.dumps(body), headers=headers, timeout=20,
+                            impersonate="chrome136")
         if resp.status_code == 200:
             return resp.json()
     except Exception:
@@ -862,69 +940,275 @@ def register_account(session, context: FlowContext, email_provider: CFEmailProvi
                             headers=headers, json=payload, timeout=15)
         _debug(f"Create account (retry): {resp.status_code}")
 
-    # Authorize callback
-    try:
-        session.get("https://auth.openai.com/api/accounts/authorize/callback", headers={
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Referer": "https://auth.openai.com/about-you",
-            "Upgrade-Insecure-Requests": "1",
-            "User-Agent": context.user_agent,
-        }, allow_redirects=True, timeout=30)
-    except Exception:
-        pass
+    if resp.status_code != 200:
+        raise RuntimeError(f"Create account failed: {resp.text[:200]}")
 
-    # Step 7: Platform OAuth token exchange (reuse session)
-    _log("[08] Exchanging Platform OAuth token...")
+    # Parse create_account response for continue_url
+    try:
+        create_json = resp.json()
+    except Exception:
+        create_json = {}
+    continue_url = str((create_json or {}).get("continue_url") or "").strip()
+    page_type = str((((create_json or {}).get("page") or {}).get("type")) or "").strip()
+    _debug(f"Create account page_type={page_type}, continue_url={continue_url[:80] if continue_url else '-'}")
+
+    # Step 7: OAuth token exchange
+    _log("[08] Exchanging OAuth token...")
     token_data = None
 
-    # Strategy A: Follow redirect chain from session
-    auth_url, p_state, p_verifier = _build_oauth_authorize_url(
-        client_id=CLIENT_ID_PLATFORM, redirect_uri=REDIRECT_URI_PLATFORM, prompt="login"
-    )
-    p_code, p_final = _oauth_follow_for_code(
-        session, auth_url, referer="https://auth.openai.com/",
-        user_agent=context.user_agent, impersonate=context.impersonate,
-    )
-    if p_code:
-        _log(f"  Got Platform code: {_mask(p_code, 12, 8)}")
-        try:
-            token_data = _exchange_code_for_token(
-                session, p_code, p_state, p_verifier,
-                CLIENT_ID_PLATFORM, REDIRECT_URI_PLATFORM,
-                proxies=proxies, email=context.email, password=context.password,
-            )
-        except Exception as exc:
-            _log(f"  Platform token exchange failed: {exc}", "!")
+    # Strategy A: Use continue_url from create_account to follow redirect chain
+    if continue_url:
+        token_data = _follow_continue_url_for_token(
+            session, context, continue_url, proxies=proxies,
+        )
+        if token_data:
+            _log("  Token obtained via continue_url!")
 
-    # Strategy B: Try Codex OAuth then fallback to Platform
+    # Strategy B: Try workspace/select if we have workspace_id in auth session cookie
     if not token_data:
-        _log("  Trying Codex OAuth fallback...")
+        workspace_id = _extract_workspace_id(session)
+        if workspace_id:
+            _log(f"  Found workspace_id, selecting...")
+            token_data = _select_workspace_and_exchange(
+                session, context, workspace_id, proxies=proxies,
+            )
+            if token_data:
+                _log("  Token obtained via workspace/select!")
+
+    # Strategy C: Re-bootstrap OAuth with Codex client_id and follow redirects
+    if not token_data:
+        _log("  Trying Codex OAuth re-bootstrap...")
         c_auth_url, c_state, c_verifier = _build_oauth_authorize_url(
             client_id="app_EMoamEEZ73f0CkXaXp7hrann",
             redirect_uri="http://localhost:1455/auth/callback",
-            prompt="login", simplified_flow=True,
+            prompt="none",
         )
         c_code, c_final = _oauth_follow_for_code(
             session, c_auth_url, referer="https://auth.openai.com/",
             user_agent=context.user_agent, impersonate=context.impersonate,
         )
         if c_code:
-            _log(f"  Got Codex code, trying Platform exchange...")
-            # Even with Codex code, try Platform exchange
             try:
                 token_data = _exchange_code_for_token(
                     session, c_code, c_state, c_verifier,
+                    "app_EMoamEEZ73f0CkXaXp7hrann",
+                    "http://localhost:1455/auth/callback",
+                    proxies=proxies, email=context.email, password=context.password,
+                )
+            except Exception as exc:
+                _log(f"  Codex token exchange failed: {exc}", "!")
+
+    # Strategy D: Platform OAuth with prompt=login
+    if not token_data:
+        _log("  Trying Platform OAuth...")
+        auth_url, p_state, p_verifier = _build_oauth_authorize_url(
+            client_id=CLIENT_ID_PLATFORM, redirect_uri=REDIRECT_URI_PLATFORM, prompt="login"
+        )
+        p_code, p_final = _oauth_follow_for_code(
+            session, auth_url, referer="https://auth.openai.com/",
+            user_agent=context.user_agent, impersonate=context.impersonate,
+        )
+        if p_code:
+            try:
+                token_data = _exchange_code_for_token(
+                    session, p_code, p_state, p_verifier,
                     CLIENT_ID_PLATFORM, REDIRECT_URI_PLATFORM,
+                    proxies=proxies, email=context.email, password=context.password,
+                )
+            except Exception as exc:
+                _log(f"  Platform token exchange failed: {exc}", "!")
+
+    if not token_data:
+        raise RuntimeError("Failed to obtain OAuth token")
+
+    _log("  Token obtained successfully!")
+    return token_data
+
+
+def _follow_continue_url_for_token(
+    session, context, continue_url: str, *,
+    proxies: Any = None, max_redirects: int = 15,
+) -> Optional[Dict[str, Any]]:
+    """Follow the continue_url redirect chain to extract OAuth code and exchange for token.
+    Handles OIDC hybrid flow where callback URL contains #code=... fragment.
+    """
+    current_url = urllib.parse.urljoin("https://auth.openai.com", continue_url.strip())
+
+    # Check if continue_url already contains a code
+    code = _extract_code_from_url(current_url)
+    if code:
+        try:
+            return _exchange_code_for_token(
+                session, code, context.auth_state, context.code_verifier,
+                context.client_id, context.redirect_uri,
+                proxies=proxies, email=context.email, password=context.password,
+            )
+        except Exception:
+            pass
+
+    for _ in range(max_redirects):
+        try:
+            resp = session.get(current_url, headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Upgrade-Insecure-Requests": "1",
+                "User-Agent": context.user_agent,
+                "Referer": "https://auth.openai.com/about-you",
+            }, allow_redirects=False, timeout=30, impersonate=context.impersonate)
+        except Exception as exc:
+            # curl_cffi throws on localhost redirect — extract code from error
+            maybe = re.search(r'(https?://localhost[^\s\'"]+)', str(exc))
+            if maybe:
+                code = _extract_code_from_url(maybe.group(1))
+                if code:
+                    try:
+                        return _exchange_code_for_token(
+                            session, code, context.auth_state, context.code_verifier,
+                            context.client_id, context.redirect_uri,
+                            proxies=proxies, email=context.email, password=context.password,
+                        )
+                    except Exception:
+                        pass
+            break
+
+        status = resp.status_code
+        location = resp.headers.get("Location") or ""
+
+        if status not in (301, 302, 303, 307, 308):
+            break
+        if not location:
+            break
+
+        next_url = urllib.parse.urljoin(current_url, location)
+
+        # Check for code in Location header
+        code = _extract_code_from_url(next_url)
+        if code:
+            try:
+                return _exchange_code_for_token(
+                    session, code, context.auth_state, context.code_verifier,
+                    context.client_id, context.redirect_uri,
                     proxies=proxies, email=context.email, password=context.password,
                 )
             except Exception:
                 pass
 
-    if not token_data:
-        raise RuntimeError("Failed to obtain Platform OAuth token")
+        # Handle login_challenge → OAuth authorize → callback#code=... (OIDC fragment)
+        if "login_challenge" in next_url or "/api/accounts/login" in next_url:
+            _debug(f"[continue] Detected login_challenge, extracting OIDC fragment")
+            try:
+                # Re-request current_url to get the OAuth authorize redirect
+                lc_resp = session.get(current_url, headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "User-Agent": context.user_agent,
+                }, allow_redirects=False, timeout=15, impersonate=context.impersonate)
+                lc_loc = lc_resp.headers.get("Location") or ""
+                if lc_loc:
+                    oauth_req_url = urllib.parse.urljoin(current_url, lc_loc)
+                    oa_resp = session.get(oauth_req_url, headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "User-Agent": context.user_agent,
+                    }, allow_redirects=False, timeout=15, impersonate=context.impersonate)
+                    oa_loc = oa_resp.headers.get("Location") or ""
+                    if oa_loc:
+                        if oa_loc.startswith("#"):
+                            full_callback = current_url + oa_loc
+                        else:
+                            full_callback = urllib.parse.urljoin(oauth_req_url, oa_loc)
+                        code = _extract_code_from_url(full_callback)
+                        if code:
+                            try:
+                                return _exchange_code_for_token(
+                                    session, code, context.auth_state, context.code_verifier,
+                                    context.client_id, context.redirect_uri,
+                                    proxies=proxies, email=context.email, password=context.password,
+                                )
+                            except Exception:
+                                pass
+            except Exception:
+                pass
 
-    _log("  Token obtained successfully!")
-    return token_data
+        current_url = next_url
+
+    return None
+
+
+def _extract_workspace_id(session) -> str:
+    """Extract workspace_id from oai-client-auth-session cookie."""
+    import gzip as _gzip
+    import zlib as _zlib
+
+    for domain in (".auth.openai.com", "auth.openai.com"):
+        try:
+            cookie_val = session.cookies.get("oai-client-auth-session", domain=domain)
+            if not cookie_val:
+                continue
+        except Exception:
+            continue
+
+        # Decode JWT-like structure to find workspace_id
+        try:
+            parts = cookie_val.split(".")
+            if len(parts) >= 2:
+                payload = parts[1]
+                # Add padding
+                payload += "=" * (4 - len(payload) % 4)
+                decoded = base64.b64decode(payload)
+                data = json.loads(decoded)
+                wid = str(data.get("workspace_id") or "")
+                if wid:
+                    return wid
+        except Exception:
+            pass
+
+        # Try decompressing gzip/zlib content
+        try:
+            raw = base64.b64decode(cookie_val + "=" * (-len(cookie_val) % 4))
+            for decompress in (lambda d: _gzip.decompress(d), lambda d: _zlib.decompress(d)):
+                try:
+                    text = decompress(raw).decode("utf-8", "replace")
+                    m = re.search(r'"workspace_id"\s*:\s*"([^"]+)"', text)
+                    if m:
+                        return m.group(1)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return ""
+
+
+def _select_workspace_and_exchange(
+    session, context, workspace_id: str, *,
+    proxies: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Select workspace and follow continue_url to get token."""
+    resp = session.post(
+        "https://auth.openai.com/api/accounts/workspace/select",
+        headers=_auth_headers(
+            user_agent=context.user_agent,
+            referer="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            content_type_json=True, include_origin=True,
+            fp=context.fingerprint, device_id=context.did,
+        ),
+        json={"workspace_id": workspace_id},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        _debug(f"workspace/select failed: {resp.status_code}")
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        return None
+
+    continue_url = str((data or {}).get("continue_url") or "").strip()
+    if not continue_url:
+        return None
+
+    return _follow_continue_url_for_token(
+        session, context, continue_url, proxies=proxies,
+    )
+
 
 
 def _build_oauth_authorize_url(*, client_id: str, redirect_uri: str,
