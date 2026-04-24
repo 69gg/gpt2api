@@ -46,10 +46,6 @@ DEFAULT_SCOPE = "openid email profile offline_access model.request model.read mo
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.112 Safari/537.36"
 
 _CHROME_PROFILES: List[Dict[str, Any]] = [
-    {"major": 131, "impersonate": "chrome131", "build": 6778, "patch_range": (86, 204),
-     "sec_ch_ua": '"Chromium";v="131", "Google Chrome";v="131", "Not_A Brand";v="99"'},
-    {"major": 133, "impersonate": "chrome133", "build": 6943, "patch_range": (35, 120),
-     "sec_ch_ua": '"Chromium";v="133", "Google Chrome";v="133", "Not_A Brand";v="99"'},
     {"major": 136, "impersonate": "chrome136", "build": 7103, "patch_range": (93, 112),
      "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not_A Brand";v="99"'},
 ]
