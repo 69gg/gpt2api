@@ -27,7 +27,8 @@ uv sync
 ```bash
 uv run python app/reg_web.py \
   --cf-url https://your-cf-email-worker.workers.dev \
-  --cf-auth <站点访问密码> \
+  --cf-auth <x-custom-auth密码> \
+  --cf-admin-auth <x-admin-auth密码（可选，走admin API）> \
   --cf-domain your-domain.com \
   --proxy http://127.0.0.1:7890
 ```

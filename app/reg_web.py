@@ -227,6 +227,10 @@ def _browser_identity_headers(user_agent: str, fp: Optional[BrowserFingerprint] 
     }
 
 
+def _random_email_local() -> str:
+    return f"oc{secrets.token_hex(5)}"
+
+
 # ==================== 邮箱服务（CF Worker） ====================
 class CFEmailProvider:
     def __init__(self, cf_url: str, cf_auth: str = "", cf_admin_auth: str = "",
@@ -237,39 +241,73 @@ class CFEmailProvider:
         self.cf_domain = cf_domain
         self.proxies = proxies
 
-    def _headers(self) -> Dict[str, str]:
-        h = {"Content-Type": "application/json"}
+    def _headers(self, *, address_jwt: str = "") -> Dict[str, str]:
+        h = {"Accept": "application/json", "Content-Type": "application/json"}
         if self.cf_auth:
-            h["Authorization"] = f"Bearer {self.cf_auth}"
+            h["x-custom-auth"] = self.cf_auth
+        if self.cf_admin_auth:
+            h["x-admin-auth"] = self.cf_admin_auth
+        if address_jwt:
+            h["Authorization"] = f"Bearer {address_jwt}"
         return h
 
     def create_email(self) -> Tuple[str, str]:
-        url = f"{self.cf_url}/api/newaddr"
-        data: Dict[str, Any] = {}
+        use_admin_api = bool(self.cf_admin_auth)
+        endpoint = f"{self.cf_url}/admin/new_address" if use_admin_api else f"{self.cf_url}/api/new_address"
+
+        local = _random_email_local()
+        data: Dict[str, Any] = {"name": local}
+        if use_admin_api:
+            data["enablePrefix"] = False
         if self.cf_domain:
             data["domain"] = self.cf_domain
-        resp = requests.post(url, json=data, headers=self._headers(),
-                             proxies=self.proxies, timeout=15, impersonate="chrome136")
-        if resp.status_code != 200:
+
+        for attempt in range(1, 6):
+            try:
+                resp = requests.post(endpoint, json=data, headers=self._headers(),
+                                     proxies=self.proxies, timeout=15, impersonate="chrome136")
+            except Exception as e:
+                if attempt >= 5:
+                    raise RuntimeError(f"create_email failed after 5 attempts: {e}")
+                time.sleep(2)
+                continue
+
+            if resp.status_code == 200:
+                result = resp.json()
+                email = str(result.get("address") or result.get("email") or "").strip()
+                jwt_token = str(result.get("jwt") or result.get("token") or "").strip()
+                if email and jwt_token:
+                    return email, jwt_token
+                raise RuntimeError(f"create_email returned incomplete data: {result}")
+
+            body = resp.text.strip().lower()
+            if resp.status_code == 400 and self.cf_domain and "invalid domain" in body:
+                data.pop("domain", None)
+                self.cf_domain = ""
+                time.sleep(1)
+                continue
+            if resp.status_code == 400 and ("already exists" in body or "unique" in body):
+                data["name"] = _random_email_local()
+                time.sleep(1)
+                continue
+            if resp.status_code == 429:
+                time.sleep(10)
+                continue
             raise RuntimeError(f"create_email failed: {resp.status_code} {resp.text[:200]}")
-        result = resp.json()
-        email = result.get("address") or result.get("email") or ""
-        jwt_token = result.get("jwt") or result.get("token") or ""
-        if not email:
-            raise RuntimeError(f"create_email returned no email: {result}")
-        return email, jwt_token
+
+        raise RuntimeError("create_email failed after 5 attempts")
 
     def snapshot_mail_ids(self, jwt: str) -> set:
-        url = f"{self.cf_url}/api/emails"
-        h = self._headers()
-        h["Authorization"] = f"Bearer {jwt}"
+        url = f"{self.cf_url}/api/mails?limit=20&offset=0"
+        h = self._headers(address_jwt=jwt)
         resp = requests.get(url, headers=h, proxies=self.proxies,
                             timeout=15, impersonate="chrome136")
         if resp.status_code != 200:
             return set()
         emails = resp.json()
-        if isinstance(emails, list):
-            return {str(e.get("id", "")) for e in emails if e.get("id")}
+        results = emails.get("results") if isinstance(emails, dict) else emails
+        if isinstance(results, list):
+            return {str(e.get("id", "")) for e in results if e.get("id")}
         return set()
 
     def wait_for_code(self, email: str, jwt: str, timeout: int = 90,
@@ -277,20 +315,20 @@ class CFEmailProvider:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                url = f"{self.cf_url}/api/emails"
-                h = self._headers()
-                h["Authorization"] = f"Bearer {jwt}"
+                url = f"{self.cf_url}/api/mails?limit=20&offset=0"
+                h = self._headers(address_jwt=jwt)
                 resp = requests.get(url, headers=h, proxies=self.proxies,
                                     timeout=15, impersonate="chrome136")
                 if resp.status_code == 200:
                     emails = resp.json()
-                    if isinstance(emails, list):
-                        for mail in emails:
+                    results = emails.get("results") if isinstance(emails, dict) else emails
+                    if isinstance(results, list):
+                        for mail in results:
                             mid = str(mail.get("id", ""))
                             if known_ids and mid in known_ids:
                                 continue
                             subject = str(mail.get("subject", ""))
-                            body = str(mail.get("text", "") or mail.get("html", "") or "")
+                            body = str(mail.get("text", "") or mail.get("html", "") or mail.get("raw", "") or "")
                             code_match = re.search(r'\b(\d{6})\b', subject + " " + body)
                             if code_match:
                                 return code_match.group(1)
