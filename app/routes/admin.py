@@ -107,6 +107,8 @@ async def trigger_register(request: Request):
         fp = BrowserFingerprint.chrome_windows()
         proxies = {"http": proxy, "https": proxy} if proxy else None
         session = curl_requests.Session(impersonate=fp.impersonate, proxies=proxies)
+        from app.reg_web import _browser_identity_headers
+        session.headers.update(_browser_identity_headers(fp.user_agent, fp=fp))
 
         email_provider = CFEmailProvider(
             cf_url=cf_url, cf_auth=cf_auth,

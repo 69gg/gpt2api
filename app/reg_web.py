@@ -687,6 +687,11 @@ def register_account(session, context: FlowContext, email_provider: CFEmailProvi
     context.impersonate = fp.impersonate
     context.user_agent = fp.user_agent
 
+    # Pre-generate device_id and set cookie (matching reg_best.py flow)
+    if not context.did:
+        context.did = str(uuid.uuid4())
+    session.cookies.set("oai-did", context.did, domain=".openai.com")
+
     state = _random_state()
     code_verifier = _pkce_verifier()
     code_challenge = _sha256_b64url_no_pad(code_verifier)
@@ -707,9 +712,10 @@ def register_account(session, context: FlowContext, email_provider: CFEmailProvi
     resp = session.get(context.auth_url, timeout=30, impersonate=context.impersonate)
     _debug(f"OAuth page status: {resp.status_code}")
 
+    # Update did from server if provided
     server_did = resp.cookies.get("oai-did") or ""
-    if not context.did:
-        context.did = server_did or str(uuid.uuid4())
+    if server_did:
+        context.did = server_did
     _log(f"  did: {_mask(context.did, 12, 8)}")
 
     # Step 2: Fetch sentinel bundle

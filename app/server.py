@@ -140,6 +140,8 @@ async def lifespan(app: FastAPI):
                         fp = BrowserFingerprint.chrome_windows()
                         proxies = {"http": reg_proxy, "https": reg_proxy} if reg_proxy else None
                         session = curl_requests.Session(impersonate=fp.impersonate, proxies=proxies)
+                        from app.reg_web import _browser_identity_headers
+                        session.headers.update(_browser_identity_headers(fp.user_agent, fp=fp))
 
                         email_provider = CFEmailProvider(
                             cf_url=cf_url, cf_auth=cf_auth,
