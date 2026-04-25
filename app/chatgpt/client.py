@@ -164,6 +164,7 @@ class ChatGPTClient:
             max_retries=3, delay=2.0, backoff=2.0, label="prepare",
         )
         if resp.status_code >= 400:
+            logger.error(f"f/conversation/prepare failed: {resp.status_code} {resp.text[:200]}")
             raise RuntimeError(f"f/conversation/prepare failed: {resp.status_code} {resp.text[:200]}")
 
         data = resp.json()
@@ -245,6 +246,7 @@ class ChatGPTClient:
             max_retries=2, delay=3.0, backoff=2.0, label="stream-fchat",
         )
         if resp.status_code >= 400:
+            logger.error(f"f/conversation failed: {resp.status_code} {resp.text[:200]}")
             raise RuntimeError(f"f/conversation failed: {resp.status_code} {resp.text[:200]}")
 
         yield from extract_chat_messages(parse_sse_stream(resp))
@@ -253,6 +255,7 @@ class ChatGPTClient:
 
     def chat(self, opts: ChatOptions) -> ChatResult:
         """Complete chat flow: bootstrap → chat-requirements → prepare → f/conversation."""
+        logger.debug(f"chat(): model={opts.model}, msgs={len(opts.messages)}, conv_id={opts.conversation_id or '-'}")
         # 1. Bootstrap
         self.sentinel.bootstrap()
 
@@ -297,6 +300,7 @@ class ChatGPTClient:
 
     def chat_stream(self, opts: ChatOptions) -> Generator[ChatMessage, None, None]:
         """Complete chat flow with streaming output."""
+        logger.debug(f"chat_stream(): model={opts.model}, msgs={len(opts.messages)}, conv_id={opts.conversation_id or '-'}")
         self.sentinel.bootstrap()
 
         req_result = self.sentinel.get_chat_requirements()

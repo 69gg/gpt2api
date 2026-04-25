@@ -121,7 +121,9 @@ class OpenAIChatAdapter:
         )
 
         try:
+            logger.info(f"Chat [{token.email}]: model={model} → upstream={upstream_model}, msgs={len(messages)}")
             result = client.chat(opts)
+            logger.info(f"Chat [{token.email}]: finished, content_len={len(result.content)}, finish={result.finish_reason}")
             token.record_success()
             token.save()
 
@@ -146,7 +148,7 @@ class OpenAIChatAdapter:
             reason = self.token_manager.classify_error(0, error_str)
             token.record_failure(reason)
             token.save()
-            logger.error(f"Chat completion error for {token.email}: {e}")
+            logger.error(f"Chat [{token.email}]: FAILED model={model} reason={reason} err={e}")
             return {"error": "upstream_error", "message": error_str}
 
     async def chat_completion_stream(self, request: Dict[str, Any]) -> Generator[str, None, None]:
@@ -171,6 +173,7 @@ class OpenAIChatAdapter:
         messages = self._build_messages(request.get("messages", []))
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         created = int(time.time())
+        logger.info(f"Stream [{token.email}]: model={model} → upstream={upstream_model}, msgs={len(messages)}")
 
         if not messages:
             return
@@ -192,8 +195,10 @@ class OpenAIChatAdapter:
             }
             yield f"data: {json.dumps(role_chunk)}\n\n"
 
+            content_len = 0
             for msg in client.chat_stream(opts):
                 if msg.content:
+                    content_len += len(msg.content)
                     content_chunk = {
                         "id": chat_id,
                         "object": "chat.completion.chunk",
@@ -204,6 +209,7 @@ class OpenAIChatAdapter:
                     yield f"data: {json.dumps(content_chunk)}\n\n"
 
                 if msg.finish_reason in ("stop", "error"):
+                    logger.info(f"Stream [{token.email}]: finished, content_len={content_len}, finish={msg.finish_reason}")
                     finish_chunk = {
                         "id": chat_id,
                         "object": "chat.completion.chunk",
@@ -221,6 +227,6 @@ class OpenAIChatAdapter:
             reason = self.token_manager.classify_error(0, error_str)
             token.record_failure(reason)
             token.save()
-            logger.error(f"Stream error for {token.email}: {e}")
+            logger.error(f"Stream [{token.email}]: FAILED model={model} reason={reason} err={e}")
 
         yield "data: [DONE]\n\n"

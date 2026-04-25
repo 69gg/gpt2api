@@ -82,11 +82,14 @@ class OpenAIImageAdapter:
         client = self._create_client(token)
 
         try:
+            logger.info(f"Image [{token.email}]: prompt={prompt[:60]}... model={upstream_model}")
             result = client.generate(prompt, model=upstream_model)
+            logger.info(f"Image [{token.email}]: status={result.status}, url={bool(result.image_url)}, asset={result.asset_pointer[:50] if result.asset_pointer else '-'}")
 
             if result.status != "success" or not result.image_url:
                 token.record_failure(FailReason.UNKNOWN)
                 token.save()
+                logger.warning(f"Image [{token.email}]: generation failed, status={result.status}")
                 return {"error": "generation_failed", "message": "Image generation failed"}
 
             token.record_success()
@@ -94,6 +97,7 @@ class OpenAIImageAdapter:
 
             images = []
             proxied_url = _make_proxy_url(result.image_url, self.deployment_url)
+            logger.info(f"Image [{token.email}]: url={proxied_url[:80]}...")
             image_data = {
                 "url": proxied_url,
                 "revised_prompt": result.revised_prompt or prompt,
@@ -128,5 +132,5 @@ class OpenAIImageAdapter:
             reason = self.token_manager.classify_error(0, error_str)
             token.record_failure(reason)
             token.save()
-            logger.error(f"Image generation error for {token.email}: {e}")
+            logger.error(f"Image [{token.email}]: FAILED reason={reason} err={e}")
             return {"error": "upstream_error", "message": error_str}
