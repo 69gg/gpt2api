@@ -20,6 +20,7 @@ from curl_cffi import requests as curl_requests
 from loguru import logger
 
 from .sentinel import SentinelClient, POWConfig
+from .retry import retry_call
 from .sse import SSEEvent, ChatMessage, parse_sse_stream, extract_chat_messages, stream_text_from_response
 
 
@@ -60,7 +61,8 @@ class ChatGPTClient:
 
     def __init__(self, access_token: str, device_id: str = "",
                  session_id: str = "", proxy: str = "",
-                 user_agent: str = "", turnstile_solver_url: str = "",
+                 user_agent: str = "", impersonate: str = "",
+                 turnstile_solver_url: str = "",
                  pow_max_iter: int = 500000):
         self.access_token = access_token
         self.device_id = device_id or str(uuid.uuid4())
@@ -68,7 +70,7 @@ class ChatGPTClient:
         self.proxy = proxy
         self.user_agent = user_agent or DEFAULT_USER_AGENT
         self._proxies = {"http": proxy, "https": proxy} if proxy else None
-        self._impersonate = "chrome131"
+        self._impersonate = impersonate or "chrome131"
 
         self.sentinel = SentinelClient(
             access_token=access_token,
@@ -76,6 +78,7 @@ class ChatGPTClient:
             session_id=self.session_id,
             proxy=proxy,
             user_agent=self.user_agent,
+            impersonate=self._impersonate,
             turnstile_solver_url=turnstile_solver_url,
             pow_max_iter=pow_max_iter,
         )
@@ -154,9 +157,11 @@ class ChatGPTClient:
         if proof_token:
             headers["Openai-Sentinel-Proof-Token"] = proof_token
 
-        resp = curl_requests.post(
+        resp = retry_call(
+            curl_requests.post,
             f"{BASE_URL}{path}", headers=headers, json=payload,
             proxies=self._proxies, impersonate=self._impersonate, timeout=30,
+            max_retries=3, delay=2.0, backoff=2.0, label="prepare",
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"f/conversation/prepare failed: {resp.status_code} {resp.text[:200]}")
@@ -232,10 +237,12 @@ class ChatGPTClient:
         if conduit_token:
             headers["Openai-Sentinel-Conduit-Api-Token"] = conduit_token
 
-        resp = curl_requests.post(
+        resp = retry_call(
+            curl_requests.post,
             f"{BASE_URL}{path}", headers=headers, json=payload,
             proxies=self._proxies, impersonate=self._impersonate,
             timeout=opts.sse_timeout, stream=True,
+            max_retries=2, delay=3.0, backoff=2.0, label="stream-fchat",
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"f/conversation failed: {resp.status_code} {resp.text[:200]}")

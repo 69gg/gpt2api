@@ -26,10 +26,20 @@ class OpenAIImageAdapter:
         self.pow_max_iter = pow_max_iter
 
     def _create_client(self, token: TokenInfo) -> ImageClient:
+        if not token.user_agent or not token.impersonate:
+            from ..reg_web import BrowserFingerprint
+            fp = BrowserFingerprint.chrome_windows()
+            user_agent = token.user_agent or fp.user_agent
+            impersonate = token.impersonate or getattr(fp, "impersonate", "chrome110")
+        else:
+            user_agent = token.user_agent
+            impersonate = token.impersonate
         chat_client = ChatGPTClient(
             access_token=token.access_token,
             device_id=token.device_id,
             session_id=token.session_id,
+            user_agent=user_agent,
+            impersonate=impersonate,
             proxy=self.proxy,
             turnstile_solver_url=self.turnstile_solver_url,
             pow_max_iter=self.pow_max_iter,

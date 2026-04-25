@@ -727,6 +727,8 @@ def _build_token_json(*, access_token: str, refresh_token: str,
         "daily_quota_total": None,
         "image_quota_remaining": None,
         "image_quota_total": None,
+        "device_id": "",
+        "session_id": "",
     }
 
 
@@ -966,6 +968,12 @@ def register_account(session, context: FlowContext, email_provider: CFEmailProvi
         raise RuntimeError("Failed to obtain Platform OAuth token")
 
     _log("  Platform token obtained!")
+    # Persist browser fingerprint so TokenManager can recreate the exact client later
+    if token_data:
+        token_data["user_agent"] = context.fingerprint.user_agent
+        token_data["impersonate"] = getattr(context.fingerprint, "impersonate", "")
+        token_data["device_id"] = context.did
+        token_data["session_id"] = str(uuid.uuid4())
     return token_data
 
 

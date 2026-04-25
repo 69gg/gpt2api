@@ -13,6 +13,9 @@ dependencies = [
     "loguru>=0.7",
     "aiofiles>=23.0",
     "watchdog>=4.0",
+    "playwright>=1.58.0",
+    "playwright-stealth>=2.0.3",
+    "websocket-client>=1.9.0",
 ]
 
 [tool.uv]

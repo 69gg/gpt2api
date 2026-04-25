@@ -18,6 +18,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from .retry import retry_call
+from .sse import SSEEvent, ChatMessage, parse_sse_stream, extract_chat_messages, stream_text_from_response
 from curl_cffi import requests as curl_requests
 from loguru import logger
 
@@ -141,7 +143,7 @@ class SentinelClient:
     BASE_URL = "https://chatgpt.com"
 
     def __init__(self, access_token: str, device_id: str, session_id: str = "",
-                 proxy: str = "", user_agent: str = "",
+                 proxy: str = "", user_agent: str = "", impersonate: str = "",
                  turnstile_solver_url: str = "", pow_max_iter: int = 500000):
         self.access_token = access_token
         self.device_id = device_id
@@ -156,7 +158,7 @@ class SentinelClient:
         self.pow_config = POWConfig(self.user_agent)
 
         self._proxies = {"http": proxy, "https": proxy} if proxy else None
-        self._impersonate = "chrome131"
+        self._impersonate = impersonate or "chrome131"
         self._cf_bm = ""
         self._cfuvid = ""
         self._bootstrapped = False
@@ -194,7 +196,8 @@ class SentinelClient:
     def bootstrap(self) -> bool:
         """GET chatgpt.com to acquire __cf_bm, _cfuvid, oai-did cookies."""
         try:
-            resp = curl_requests.get(
+            resp = retry_call(
+                curl_requests.get,
                 f"{self.BASE_URL}/",
                 headers={
                     "User-Agent": self.user_agent,
@@ -212,6 +215,7 @@ class SentinelClient:
                 proxies=self._proxies,
                 impersonate=self._impersonate,
                 timeout=30,
+                max_retries=3, delay=2.0, backoff=2.0, label="bootstrap",
             )
             self._cf_bm = resp.cookies.get("__cf_bm", "")
             self._cfuvid = resp.cookies.get("_cfuvid", "")
@@ -234,7 +238,8 @@ class SentinelClient:
         path = "/backend-api/sentinel/chat-requirements"
         req_token = self.pow_config.requirements_token()
 
-        resp = curl_requests.post(
+        resp = retry_call(
+            curl_requests.post,
             f"{self.BASE_URL}{path}",
             headers={
                 **self._common_headers(path),
@@ -244,6 +249,7 @@ class SentinelClient:
             proxies=self._proxies,
             impersonate=self._impersonate,
             timeout=30,
+            max_retries=3, delay=2.0, backoff=2.0, label="chat-req-single",
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"chat-requirements failed: {resp.status_code} {resp.text[:200]}")
@@ -267,7 +273,8 @@ class SentinelClient:
         path = "/backend-api/sentinel/chat-requirements/prepare"
         req_token = self.pow_config.requirements_token()
 
-        resp = curl_requests.post(
+        resp = retry_call(
+            curl_requests.post,
             f"{self.BASE_URL}{path}",
             headers={
                 **self._common_headers(path),
@@ -277,6 +284,7 @@ class SentinelClient:
             proxies=self._proxies,
             impersonate=self._impersonate,
             timeout=30,
+            max_retries=3, delay=2.0, backoff=2.0, label="chat-req-prepare",
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"chat-requirements/prepare failed: {resp.status_code} {resp.text[:200]}")
@@ -295,7 +303,8 @@ class SentinelClient:
         if turnstile_resp:
             payload["turnstile"] = turnstile_resp
 
-        resp = curl_requests.post(
+        resp = retry_call(
+            curl_requests.post,
             f"{self.BASE_URL}{path}",
             headers={
                 **self._common_headers(path),
@@ -305,6 +314,7 @@ class SentinelClient:
             proxies=self._proxies,
             impersonate=self._impersonate,
             timeout=30,
+            max_retries=3, delay=2.0, backoff=2.0, label="chat-req-finalize",
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"chat-requirements/finalize failed: {resp.status_code} {resp.text[:200]}")

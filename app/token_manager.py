@@ -70,6 +70,8 @@ class TokenInfo:
     daily_quota_total: Optional[int] = None
     image_quota_remaining: Optional[int] = None
     image_quota_total: Optional[int] = None
+    user_agent: str = ""
+    impersonate: str = ""
     _path: Optional[str] = None  # file path for persistence
 
     @staticmethod
@@ -105,6 +107,8 @@ class TokenInfo:
             daily_quota_total=data.get("daily_quota_total"),
             image_quota_remaining=data.get("image_quota_remaining"),
             image_quota_total=data.get("image_quota_total"),
+            user_agent=data.get("user_agent", ""),
+            impersonate=data.get("impersonate", ""),
             _path=path,
         )
 
@@ -134,6 +138,8 @@ class TokenInfo:
             "daily_quota_total": self.daily_quota_total,
             "image_quota_remaining": self.image_quota_remaining,
             "image_quota_total": self.image_quota_total,
+            "user_agent": self.user_agent,
+            "impersonate": self.impersonate,
         }
 
     @property

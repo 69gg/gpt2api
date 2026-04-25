@@ -106,9 +106,26 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
         if not isinstance(data, dict):
             continue
 
+        # --- Metadata events (message_marker, conversation_async_status, etc.) ---
+        # These carry conversation_id / message_id needed for image generation polling
+        evt_type = data.get("type", "")
+        if evt_type in ("message_marker", "conversation_async_status",
+                        "message_stream_complete", "input_message"):
+            conv_id = data.get("conversation_id", "")
+            msg_id = data.get("message_id", "") or (data.get("input_message") or {}).get("id", "")
+            if conv_id or msg_id:
+                yield ChatMessage(
+                    conversation_id=conv_id,
+                    message_id=msg_id,
+                    role="assistant",
+                    content="",
+                )
+            continue
+
         # --- JSON Patch incremental delta ---
         # e.g. {"p": "/message/content/parts/0", "o": "append", "v": "Hello"}
-        if "p" in data and "o" in data and "v" in data:
+        # But {"p": "", "o": "add", "v": {"message": ...}} is a full message update, skip to that branch
+        if "p" in data and "o" in data and "v" in data and not (data.get("p") == "" and isinstance(data.get("v"), dict)):
             patch_value = data["v"]
             conv_id = data.get("conversation_id", "")
             msg_id = data.get("message_id", "")
@@ -116,14 +133,25 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
             if key not in accumulators:
                 accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id}
             # Track accumulation for full-message fallback, but yield only the delta
+            patch_path = data.get("p", "")
             if isinstance(patch_value, str):
-                accumulators[key]["text"] += patch_value
-                yield ChatMessage(
-                    message_id=msg_id,
-                    conversation_id=conv_id,
-                    role="assistant",
-                    content=patch_value,
-                )
+                if "parts/" in patch_path or patch_path == "":
+                    # Text content delta
+                    accumulators[key]["text"] += patch_value
+                    yield ChatMessage(
+                        message_id=msg_id,
+                        conversation_id=conv_id,
+                        role="assistant",
+                        content=patch_value,
+                    )
+                elif patch_path == "/message/status" and patch_value == "finished_successfully":
+                    yield ChatMessage(
+                        message_id=msg_id,
+                        conversation_id=conv_id,
+                        role="assistant",
+                        content="",
+                        finish_reason="stop",
+                    )
             elif isinstance(patch_value, list) and data.get("o") == "patch":
                 # Batch patch: v is a list of patch operations
                 for sub_patch in patch_value:

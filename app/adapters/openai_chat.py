@@ -49,10 +49,22 @@ class OpenAIChatAdapter:
         self.sse_timeout = sse_timeout
 
     def _create_client(self, token: TokenInfo) -> ChatGPTClient:
+        # Old tokens may not have user_agent/impersonate persisted.
+        # Fall back to the default fingerprint used during registration.
+        if not token.user_agent or not token.impersonate:
+            from ..reg_web import BrowserFingerprint
+            fp = BrowserFingerprint.chrome_windows()
+            user_agent = token.user_agent or fp.user_agent
+            impersonate = token.impersonate or getattr(fp, "impersonate", "chrome110")
+        else:
+            user_agent = token.user_agent
+            impersonate = token.impersonate
         return ChatGPTClient(
             access_token=token.access_token,
             device_id=token.device_id,
             session_id=token.session_id,
+            user_agent=user_agent,
+            impersonate=impersonate,
             proxy=self.proxy,
             turnstile_solver_url=self.turnstile_solver_url,
             pow_max_iter=self.pow_max_iter,

@@ -17,6 +17,7 @@ from curl_cffi import requests as curl_requests
 from loguru import logger
 
 from .client import ChatGPTClient, ChatOptions, ChatResult, BASE_URL
+from .retry import retry_call
 from .sse import ChatMessage, parse_sse_stream, extract_chat_messages
 
 
@@ -36,6 +37,7 @@ class ImageClient:
 
     def __init__(self, chat_client: ChatGPTClient):
         self.client = chat_client
+        self._last_conv_id = ""
 
     def generate(self, prompt: str, model: str = "gpt-5-3",
                  conversation_id: str = "") -> ImageResult:
@@ -78,6 +80,7 @@ class ImageClient:
         for msg in self.client.stream_fchat(chat_token, proof_token, conduit_token, opts):
             if msg.conversation_id:
                 result.conversation_id = msg.conversation_id
+                self._last_conv_id = msg.conversation_id
             if msg.message_id:
                 result.message_id = msg.message_id
             if msg.asset_pointer:
@@ -88,10 +91,13 @@ class ImageClient:
                 result.status = "error"
                 return result
 
-        # 4. If we got asset_pointer but no direct URL, poll for image
-        if asset_pointer and not result.image_url:
+        # 4. Poll conversation for image URL (async image generation)
+        # Image generation is asynchronous: the tool message with asset_pointer
+        # may not appear until the image is fully rendered.
+        if result.conversation_id and not result.image_url:
             result.image_url = self._poll_for_image(
-                result.conversation_id, result.message_id, asset_pointer
+                result.conversation_id, result.message_id, asset_pointer,
+                max_wait=300,
             )
 
         result.asset_pointer = asset_pointer
@@ -109,49 +115,95 @@ class ImageClient:
 
         while time.time() < deadline:
             try:
-                resp = curl_requests.get(
+                resp = retry_call(
+                    curl_requests.get,
                     f"{BASE_URL}{path}",
                     headers=self.client._common_headers(path),
                     proxies=self.client._proxies,
                     impersonate=self.client._impersonate,
                     timeout=30,
+                    max_retries=2, delay=2.0, backoff=2.0, label="poll-image",
                 )
                 if resp.status_code != 200:
                     time.sleep(3)
                     continue
 
                 data = resp.json()
-                # Navigate conversation tree to find our message
                 mapping = data.get("mapping") or {}
+                logger.debug(f"Poll: {len(mapping)} nodes, conv={conversation_id}")
+
+                # Scan ALL messages for image content
                 for node_id, node in mapping.items():
                     msg = node.get("message") or {}
-                    if msg.get("id") == message_id:
-                        content = msg.get("content") or {}
-                        parts = content.get("parts") or []
+                    content = msg.get("content") or {}
+                    content_type = content.get("content_type", "")
+                    parts = content.get("parts") or []
+                    meta = msg.get("metadata") or {}
+                    async_type = meta.get("async_task_type", "")
+
+                    # Detect upstream image generation failure
+                    if async_type == "image_gen" and content_type == "text":
+                        for part in parts:
+                            if isinstance(part, str) and ("error" in part.lower() or "failed" in part.lower()):
+                                logger.debug(f"Poll: upstream image gen failed: {part[:80]}")
+                                return ""
+
+                    # Check for image content types
+                    if content_type in ("image_asset_pointer", "multimodal_text"):
                         for part in parts:
                             if isinstance(part, dict):
-                                # Check for image URL
                                 url = part.get("image_url") or part.get("url") or ""
                                 if url:
+                                    logger.debug(f"Poll: found image_url in {content_type}")
                                     return url
-                                # Check for asset_pointer match
                                 ap = part.get("asset_pointer", "")
-                                if ap == asset_pointer:
-                                    # Try to download via estuary
-                                    return self._download_asset(ap)
-                            elif isinstance(part, str):
-                                if part.startswith("http") and (
-                                    "oaiusercontent" in part or
-                                    "openai" in part
-                                ):
-                                    return part
+                                if ap:
+                                    logger.debug(f"Poll: found asset_pointer={ap[:50]} in {content_type}")
+                                    dl = self._download_asset(ap)
+                                    if dl:
+                                        logger.debug(f"Poll: download_url={dl[:80]}")
+                                        return dl
 
-                # Check if message is still generating
-                msg_node = mapping.get(message_id, {})
-                msg_data = msg_node.get("message", {})
-                status = msg_data.get("status", "")
-                if status == "finished_successfully":
+                    # Also check any message for image URLs or asset pointers
+                    for part in parts:
+                        if isinstance(part, dict):
+                            url = part.get("image_url") or part.get("url") or ""
+                            if url and ("oaiusercontent" in url or "openai" in url):
+                                return url
+                            ap = part.get("asset_pointer", "")
+                            if ap and (ap.startswith("file-service://") or ap.startswith("sediment://")):
+                                dl_url = self._download_asset(ap)
+                                if dl_url:
+                                    return dl_url
+                        elif isinstance(part, str):
+                            if part.startswith("http") and (
+                                "oaiusercontent" in part or
+                                "openai" in part
+                            ):
+                                return part
+
+                # Check if conversation is still generating
+                # Look for async_status in the response
+                async_status = data.get("async_status")
+                if async_status is not None and async_status != 0:
+                    # Still generating, keep polling
+                    time.sleep(3)
+                    continue
+
+                # If no async_status and no image found, check if all messages are done
+                all_done = True
+                for node_id, node in mapping.items():
+                    msg = node.get("message") or {}
+                    status = msg.get("status", "")
+                    if status and status not in ("finished_successfully", "in_progress"):
+                        continue
+                    if status == "in_progress":
+                        all_done = False
+                        break
+
+                if all_done:
                     break
+
             except Exception as e:
                 logger.debug(f"Poll error: {e}")
 
@@ -160,24 +212,55 @@ class ImageClient:
         return ""
 
     def _download_asset(self, asset_pointer: str) -> str:
-        """Try to get a downloadable URL from asset_pointer via estuary."""
+        """Get a signed download URL from asset_pointer.
+
+        Two formats are supported:
+        - file-service://{fid} → /backend-api/files/{fid}/download
+        - sediment://{fid}    → /backend-api/conversation/{cid}/attachment/{fid}/download
+        Both return JSON {"download_url": "..."} with a signed CDN URL.
+        """
         if not asset_pointer:
             return ""
-        try:
+
+        # Determine API endpoint based on asset_pointer prefix
+        if asset_pointer.startswith("file-service://"):
+            fid = asset_pointer.replace("file-service://", "")
+            path = f"/backend-api/files/{fid}/download"
+        elif asset_pointer.startswith("sediment://"):
+            fid = asset_pointer.replace("sediment://", "")
+            if not self._last_conv_id:
+                logger.debug("Cannot download sediment asset without conversation_id")
+                return ""
+            path = f"/backend-api/conversation/{self._last_conv_id}/attachment/{fid}/download"
+        else:
+            # Fallback: try estuary
             path = f"/backend-api/estuary/content?id={asset_pointer}"
-            resp = curl_requests.get(
+
+        try:
+            resp = retry_call(
+                curl_requests.get,
                 f"{BASE_URL}{path}",
                 headers=self.client._common_headers(path),
                 proxies=self.client._proxies,
                 impersonate=self.client._impersonate,
                 timeout=30,
-                allow_redirects=True,
+                allow_redirects=False,
+                max_retries=2, delay=2.0, backoff=2.0, label="download-asset",
             )
-            # If redirected, the final URL might be the image URL
             if resp.status_code == 200:
+                data = resp.json()
+                dl_url = data.get("download_url", "")
+                if dl_url:
+                    return dl_url
+                # Fallback: if redirected, the final URL might be the image
                 final_url = str(resp.url)
                 if "oaiusercontent" in final_url or "openai" in final_url:
                     return final_url
-        except Exception:
-            pass
+            # If 302 redirect, follow to get the actual URL
+            elif resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                if location and ("oaiusercontent" in location or "openai" in location):
+                    return location
+        except Exception as e:
+            logger.debug(f"Download asset error: {e}")
         return ""
