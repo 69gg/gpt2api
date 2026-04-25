@@ -6,9 +6,11 @@ OpenAI/Anthropic 兼容 API，后端接入 ChatGPT Web Chat (`chatgpt.com`)。
 - `/v1/chat/completions` (OpenAI 聊天)
 - `/v1/responses` (OpenAI Responses)
 - `/v1/messages` (Anthropic Messages)
-- `/v1/images/generations` (图片生成)
+- `/v1/images/generations` (图片生成，支持图片代理)
 - `/v1/models`
 - `/admin/*` Token 池管理
+- 单 token 代理配置（`http`/`socks5`/`socks5h`）
+- 分布式注册脚本自动推送 token
 
 ## 依赖
 
@@ -141,6 +143,51 @@ curl http://localhost:8000/v1/images/generations \
   }'
 ```
 
+## Token 格式
+
+每个 token 保存为独立的 JSON 文件在 `web_token/` 目录下。token 文件支持 `proxy` 字段设置**单 token 代理**，优先于全局代理：
+
+```json
+{
+  "email": "tmpo...@hwqs.dadongbei.asia",
+  "proxy": "socks5://user:pass@host:port",
+  "...": "..."
+}
+```
+
+支持的代理类型：`http://`、`socks5://`、`socks5h://`。
+
+## 图片代理
+
+当 `server.deployment_url` 配置后，图片生成返回的 URL 会自动替换为 gpt2api 部署下的代理链接：
+
+```yaml
+server:
+  deployment_url: "https://your-domain.com"  # 或 http://localhost:8000
+```
+
+代理端点 `/p/img/{base64url_estuary_url}` 会带正确的 Referer 和 auth 头向 estuary 获取图片，绕过防盗链。
+
+## 分布式注册
+
+`reg_distributed.py` 可独立运行，注册完成后自动推送到多个 gpt2api 实例：
+
+```bash
+uv run python reg_distributed.py \
+  --cf-url https://your-cf-email-worker.workers.dev \
+  --cf-auth xxx \
+  --instances "http://host1:8000,http://host2:8000" \
+  --admin-key admin-gpt2api \
+  --count 5 \
+  --save-local
+```
+
+参数说明：
+- `--instances`: 逗号分隔的 gpt2api 部署地址
+- `--admin-key`: 管理端点密钥（用于 POST /admin/tokens）
+- `--count`: 注册数量
+- `--save-local`: 是否同时保存到本地 `web_token/` 目录
+
 ## 管理端点
 
 所有管理端点需要 `X-Admin-Key` 头：
@@ -160,6 +207,18 @@ curl -X POST http://localhost:8000/admin/register \
   -H "Content-Type: application/json" \
   -d '{"cf_url":"https://your-worker.workers.dev","cf_auth":"xxx"}'
 
+# 添加 token
+curl -X POST http://localhost:8000/admin/tokens \
+  -H "X-Admin-Key: admin-gpt2api" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "user@example.com",
+    "access_token": "eyJ...",
+    "refresh_token": "rt_...",
+    "proxy": "http://127.0.0.1:7890",
+    "status": "active"
+  }'
+
 # 禁用/启用 token
 curl -X POST http://localhost:8000/admin/tokens/email@example.com/disable \
   -H "X-Admin-Key: admin-gpt2api"
@@ -177,6 +236,7 @@ gpt2api/
 ├── config.yaml             # 配置文件
 ├── pyproject.toml          # uv 依赖
 ├── web_token/              # 自动生成的 token 文件（.gitignore）
+├── reg_distributed.py     # 分布式注册脚本（独立运行，自动推送到实例）
 ├── app/
 │   ├── server.py           # FastAPI 应用 + 后台任务
 │   ├── config.py           # 配置管理
@@ -200,7 +260,8 @@ gpt2api/
 │       ├── response.py
 │       ├── messages.py
 │       ├── models.py
-│       └── admin.py
+│       ├── admin.py
+│       └── proxy.py
 ```
 
 ## Token 生命周期
