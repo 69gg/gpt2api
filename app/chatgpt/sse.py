@@ -68,11 +68,12 @@ def parse_sse_stream(response) -> Generator[SSEEvent, None, None]:
                     data_buf += "\n" + line
                 else:
                     data_buf = line
+    except GeneratorExit:
+        return
     except Exception as e:
         yield SSEEvent(event="error", data="", error=str(e))
     finally:
-        if data_buf:
-            yield SSEEvent(event=event_type, data=data_buf)
+        pass
 
 
 def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[ChatMessage, None, None]:
