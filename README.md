@@ -20,7 +20,7 @@ uv sync
 
 ## 快速开始
 
-### 1. 注册账号并获取 Web Token
+### 1. 注册账号并获取 Platform Token
 
 需要自建/接入一个 Cloudflare Worker 邮箱服务，然后运行注册脚本：
 
@@ -33,7 +33,7 @@ uv run python app/reg_web.py \
   --proxy http://127.0.0.1:7890
 ```
 
-注册成功后 token 保存到 `web_token/` 目录。
+注册成功后获取的是 **Platform OAuth token**，直接保存到 `web_token/` 目录。该 token 可直接用于 `chatgpt.com` 的 Web Chat API（`f/conversation` 端点），**无需额外的 webchat token 获取步骤**。
 
 ### 2. 配置服务
 
@@ -214,5 +214,6 @@ gpt2api/
 
 - **web_token/** 目录包含敏感凭证，已加入 `.gitignore`，请勿提交到仓库
 - `chatgpt.com` 的反爬策略变化频繁，`app/chatgpt/` 下的实现需要持续维护
-- Turnstile 求解器目前支持外部服务和 Capsolver；纯 Python VM 求解器待后续实现
+- **Platform OAuth token 可直接用于 `chatgpt.com` 的 Web Chat API**，无需单独获取 webchat token；服务端通过 `SentinelClient` 自动处理 chat-requirements + POW
+- SSE 流已适配 `chatgpt.com` 最新的 `delta` 事件 + JSON Patch 增量格式
 - 免费账号有配额限制，建议用多个 token 轮询分担负载
