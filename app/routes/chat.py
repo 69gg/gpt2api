@@ -44,5 +44,32 @@ async def chat_completions(request: Request):
 
 
 async def _stream_wrapper(adapter: OpenAIChatAdapter, body: Dict[str, Any]):
-    async for chunk in adapter.chat_completion_stream(body):
-        yield chunk
+    """Bridge sync generator to async StreamingResponse.
+
+    Runs chat_completion_stream in a background thread and yields chunks
+    via an asyncio queue so the event loop is never blocked.
+    """
+    import queue
+    import threading
+
+    sync_q = queue.Queue()
+
+    def _run_sync():
+        try:
+            for chunk in adapter.chat_completion_stream(body):
+                sync_q.put(("chunk", chunk))
+            sync_q.put(("done", None))
+        except Exception as e:
+            sync_q.put(("error", e))
+
+    thread = threading.Thread(target=_run_sync, daemon=True)
+    thread.start()
+
+    loop = asyncio.get_event_loop()
+    while True:
+        kind, val = await loop.run_in_executor(None, sync_q.get)
+        if kind == "done":
+            break
+        if kind == "error":
+            raise val
+        yield val

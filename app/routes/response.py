@@ -3,6 +3,9 @@
 """
 from __future__ import annotations
 
+import asyncio
+import queue
+import threading
 from typing import Any, Dict
 
 from fastapi import APIRouter, Request
@@ -42,5 +45,25 @@ async def create_response(request: Request):
 
 
 async def _stream_wrapper(adapter: OpenAIResponseAdapter, body: Dict[str, Any]):
-    async for chunk in adapter.create_response_stream(body):
-        yield chunk
+    """Bridge sync generator to async StreamingResponse."""
+    sync_q = queue.Queue()
+
+    def _run_sync():
+        try:
+            for chunk in adapter.create_response_stream(body):
+                sync_q.put(("chunk", chunk))
+            sync_q.put(("done", None))
+        except Exception as e:
+            sync_q.put(("error", e))
+
+    thread = threading.Thread(target=_run_sync, daemon=True)
+    thread.start()
+
+    loop = asyncio.get_event_loop()
+    while True:
+        kind, val = await loop.run_in_executor(None, sync_q.get)
+        if kind == "done":
+            break
+        if kind == "error":
+            raise val
+        yield val

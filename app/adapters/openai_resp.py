@@ -107,7 +107,7 @@ class OpenAIResponseAdapter:
             },
         }
 
-    async def create_response_stream(self, request: Dict[str, Any]) -> Generator[str, None, None]:
+    def create_response_stream(self, request: Dict[str, Any]) -> Generator[str, None, None]:
         """Handle streaming Responses API request."""
         model = request.get("model", "auto")
         input_data = request.get("input", [])
@@ -165,7 +165,7 @@ class OpenAIResponseAdapter:
         yield f"data: {json.dumps(content_start)}\n\n"
 
         # Stream text deltas
-        async for chunk in self.chat_adapter.chat_completion_stream(chat_request):
+        for chunk in self.chat_adapter.chat_completion_stream(chat_request):
             # Parse the chunk to extract content
             if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
                 try:

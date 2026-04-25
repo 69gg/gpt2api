@@ -151,7 +151,7 @@ class OpenAIChatAdapter:
             logger.error(f"Chat [{token.email}]: FAILED model={model} reason={reason} err={e}")
             return {"error": "upstream_error", "message": error_str}
 
-    async def chat_completion_stream(self, request: Dict[str, Any]) -> Generator[str, None, None]:
+    def chat_completion_stream(self, request: Dict[str, Any]) -> Generator[str, None, None]:
         """Handle streaming chat completion request. Yields SSE-formatted chunks."""
         token = self.token_manager.get_available()
         if not token:
