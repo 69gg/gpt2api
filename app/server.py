@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
     app.state.resp_adapter = resp_adapter
     app.state.anthropic_adapter = anthropic_adapter
     app.state.image_adapter = image_adapter
-    app.state.deployment_url = get_config("server.deployment_url", "")
+    app.state.deployment_url = deployment_url
 
     # Start background tasks
     tasks = []
