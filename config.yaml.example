@@ -1,0 +1,46 @@
+server:
+  host: "0.0.0.0"
+  port: 8000
+  api_key: "sk-gpt2api"            # API 访问密钥
+  admin_key: "admin-gpt2api"       # 管理端点密钥
+  deployment_url: ""               # gpt2api 部署 URL（用于图片代理，如 https://your-domain.com）
+
+register:
+  cf_url: ""                       # Cloudflare Worker 邮箱后端 URL
+  cf_auth: ""                      # 站点访问密码
+  cf_admin_auth: ""                # 管理密码
+  cf_domain: ""                    # 邮箱域名
+  proxy: ""                        # 注册用代理
+  auto_register: false             # 自动注册（token 不足时）
+  min_tokens: 3
+  max_register_parallel: 1
+  register_interval: 60
+
+token:
+  refresh_interval_hours: 2        # 自动刷新过期 token
+  dead_retain_hours: 24            # 死 token 保留时间
+  cooling_reset_hours: 24          # 冷却重置时间
+  fail_threshold: 5                # 失败多少次标记为 dead
+  load_balance: "round-robin"      # 负载策略: round-robin / random / least-used
+
+chatgpt:
+  proxy: ""                        # 全局代理（每个 token 的 proxy 字段优先）
+  sse_timeout: 120
+  pow_max_iter: 500000
+  image_download_timeout: 60
+  turnstile_solver_url: ""         # 外部 Turnstile 求解器（可选）
+
+models:
+  - id: "gpt-5.3-codex"
+    upstream: "auto"
+  - id: "gpt-5.2-codex"
+    upstream: "auto"
+  - id: "gpt-5.1-codex"
+    upstream: "auto"
+  - id: "gpt-5-codex"
+    upstream: "auto"
+  - id: "o4-mini"
+    upstream: "o4-mini"
+  - id: "gpt-image-2"
+    upstream: "gpt-5-3"
+    type: "image"
