@@ -39,6 +39,12 @@ uv run python app/reg_web.py \
 
 ### 2. 配置服务
 
+复制示例配置并编辑：
+
+```bash
+cp config.yaml.example config.yaml
+```
+
 编辑 `config.yaml`：
 
 ```yaml
@@ -245,7 +251,7 @@ curl -X DELETE http://localhost:8000/admin/tokens/email@example.com \
 ```
 gpt2api/
 ├── main.py                 # 启动入口
-├── config.yaml             # 配置文件
+├── config.yaml.example     # 示例配置（复制为 config.yaml 使用）
 ├── pyproject.toml          # uv 依赖
 ├── web_token/              # 自动生成的 token 文件（.gitignore）
 ├── reg_distributed.py      # 分布式注册脚本（独立运行，自动推送到实例）
