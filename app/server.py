@@ -156,7 +156,7 @@ async def lifespan(app: FastAPI):
                             redirect_uri="https://platform.openai.com/auth/callback",
                             client_id="app_2SKx67EdpoN0G6j64rFvigXD",
                         )
-                        token_data = register_account(session, context, email_provider, proxies=proxies)
+                        token_data = register_account(session, context, email_provider, proxies=proxies, proxy=reg_proxy)
                         from app.token_manager import TokenInfo
                         token = TokenInfo.from_dict(token_data)
                         tm.add_token(token)
