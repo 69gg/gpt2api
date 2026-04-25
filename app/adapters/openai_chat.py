@@ -17,11 +17,16 @@ from app.token_manager import TokenManager, TokenInfo, FailReason
 
 # Model mapping: OpenAI model name → chatgpt.com upstream model name
 MODEL_MAP = {
-    "gpt-5.3-codex": "auto",
-    "gpt-5.2-codex": "auto",
-    "gpt-5.1-codex": "auto",
-    "gpt-5-codex": "auto",
-    "o4-mini": "o4-mini",
+    "gpt-5-3": "gpt-5-3",
+    "gpt-5-2": "gpt-5-2",
+    "gpt-5-1": "gpt-5-1",
+    "gpt-5": "gpt-5",
+    "gpt-5-mini": "gpt-5-mini",
+    "gpt-5-3-mini": "gpt-5-3-mini",
+    "gpt-5-4-t-mini": "gpt-5-4-t-mini",
+    "auto": "auto",
+    "research": "research",
+    # Legacy aliases
     "gpt-4o": "auto",
     "gpt-4o-mini": "auto",
     "gpt-image-2": "gpt-5-3",

@@ -10,13 +10,14 @@ from app.config import get_config
 
 # Default model list
 DEFAULT_MODELS = [
-    {"id": "gpt-5.3-codex", "upstream": "auto", "type": "chat"},
-    {"id": "gpt-5.2-codex", "upstream": "auto", "type": "chat"},
-    {"id": "gpt-5.1-codex", "upstream": "auto", "type": "chat"},
-    {"id": "gpt-5-codex", "upstream": "auto", "type": "chat"},
-    {"id": "o4-mini", "upstream": "o4-mini", "type": "chat"},
-    {"id": "gpt-4o", "upstream": "auto", "type": "chat"},
-    {"id": "gpt-4o-mini", "upstream": "auto", "type": "chat"},
+    {"id": "gpt-5-3", "upstream": "gpt-5-3", "type": "chat"},
+    {"id": "gpt-5-2", "upstream": "gpt-5-2", "type": "chat"},
+    {"id": "gpt-5-1", "upstream": "gpt-5-1", "type": "chat"},
+    {"id": "gpt-5", "upstream": "gpt-5", "type": "chat"},
+    {"id": "gpt-5-mini", "upstream": "gpt-5-mini", "type": "chat"},
+    {"id": "gpt-5-3-mini", "upstream": "gpt-5-3-mini", "type": "chat"},
+    {"id": "gpt-5-4-t-mini", "upstream": "gpt-5-4-t-mini", "type": "chat"},
+    {"id": "auto", "upstream": "auto", "type": "chat"},
     {"id": "gpt-image-2", "upstream": "gpt-5-3", "type": "image"},
 ]
 
