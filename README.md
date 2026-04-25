@@ -45,8 +45,9 @@ uv run python app/reg_web.py \
 server:
   host: "0.0.0.0"
   port: 8000
-  api_key: "sk-gpt2api"      # API 访问密钥
-  admin_key: "admin-gpt2api" # 管理端点密钥
+  api_key: "sk-gpt2api"            # API 访问密钥
+  admin_key: "admin-gpt2api"       # 管理端点密钥
+  deployment_url: ""               # gpt2api 部署 URL（用于图片代理，如 https://your-domain.com）
 
 register:
   cf_url: ""                       # Cloudflare Worker 邮箱后端 URL
@@ -63,9 +64,6 @@ token:
   cooling_reset_hours: 24          # 冷却重置时间
   fail_threshold: 5                # 失败多少次标记为 dead
   load_balance: "round-robin"      # 负载策略: round-robin / random / least-used
-
-server:
-  deployment_url: ""                # gpt2api 部署 URL（用于图片代理，如 https://your-domain.com）
 
 chatgpt:
   proxy: ""                        # 全局代理（每个 token 的 proxy 字段优先）
@@ -236,7 +234,7 @@ gpt2api/
 ├── config.yaml             # 配置文件
 ├── pyproject.toml          # uv 依赖
 ├── web_token/              # 自动生成的 token 文件（.gitignore）
-├── reg_distributed.py     # 分布式注册脚本（独立运行，自动推送到实例）
+├── reg_distributed.py      # 分布式注册脚本（独立运行，自动推送到实例）
 ├── app/
 │   ├── server.py           # FastAPI 应用 + 后台任务
 │   ├── config.py           # 配置管理
@@ -247,6 +245,7 @@ gpt2api/
 │   ├── chatgpt/
 │   │   ├── client.py       # Web Chat 客户端 (f/conversation)
 │   │   ├── sentinel.py     # Sentinel + POW 解算
+│   │   ├── retry.py        # 重试工具
 │   │   ├── sse.py          # SSE 流解析
 │   │   ├── image.py        # 图片生成
 │   │   └── turnstile.py    # Turnstile 求解器（外部服务/VM）
