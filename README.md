@@ -171,6 +171,7 @@ server:
 `reg_distributed.py` 可独立运行，注册完成后自动推送到多个 gpt2api 实例：
 
 ```bash
+# 注册 5 个账号
 uv run python reg_distributed.py \
   --cf-url https://your-cf-email-worker.workers.dev \
   --cf-auth xxx \
@@ -178,12 +179,25 @@ uv run python reg_distributed.py \
   --admin-key admin-gpt2api \
   --count 5 \
   --save-local
+
+# 无限注册模式（Ctrl+C 优雅退出）
+uv run python reg_distributed.py \
+  --cf-url https://your-cf-email-worker.workers.dev \
+  --cf-auth xxx \
+  --instances "http://host1:8000" \
+  --infinite --interval 30
 ```
 
 参数说明：
 - `--instances`: 逗号分隔的 gpt2api 部署地址
 - `--admin-key`: 管理端点密钥（用于 POST /admin/tokens）
-- `--count`: 注册数量
+- `--count`: 注册数量（0 或 `--infinite` 为无限模式）
+- `--infinite`: 无限注册，持续运行直到 Ctrl+C
+- `--interval`: 两次注册间隔秒数（默认 10）
+- `--retry`: 单次注册最大重试次数（默认 3）
+- `--retry-delay`: 注册重试基础延迟秒数（默认 10，线性递增）
+- `--push-retry`: 推送到实例最大重试次数（默认 3）
+- `--push-retry-delay`: 推送重试基础延迟秒数（默认 5）
 - `--save-local`: 是否同时保存到本地 `web_token/` 目录
 
 ## 管理端点
