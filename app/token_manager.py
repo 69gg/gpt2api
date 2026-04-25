@@ -451,10 +451,14 @@ class TokenManager:
         if status_code == 401:
             return FailReason.TOKEN_EXPIRED
         if status_code == 403:
-            if "banned" in body.lower() or "suspended" in body.lower():
+            body_lower = body.lower()
+            if "banned" in body_lower or "suspended" in body_lower:
                 return FailReason.BANNED
-            if "cloudflare" in body.lower() or "challenge" in body.lower():
+            if "cloudflare" in body_lower or "challenge" in body_lower:
                 return FailReason.CF_CHALLENGE
+            if "unusual activity" in body_lower:
+                # POW not solved or sentinel token issue — retryable, not banned
+                return FailReason.UNKNOWN
             return FailReason.BANNED
         if status_code == 429:
             return FailReason.RATE_LIMITED

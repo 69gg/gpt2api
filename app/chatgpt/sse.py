@@ -78,14 +78,18 @@ def parse_sse_stream(response) -> Generator[SSEEvent, None, None]:
 def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[ChatMessage, None, None]:
     """Extract ChatMessage objects from SSE events.
 
-    Focuses on the 'conversation' event type which contains message deltas.
+    Supports both old 'conversation' event type and new 'delta' event type
+    with full-message updates and JSON Patch incremental updates.
     """
+    accumulators: Dict[str, Dict[str, Any]] = {}
+
     for event in events:
         if event.error:
             yield ChatMessage(finish_reason="error", content=event.error)
             return
 
-        if event.event != "conversation" and event.event != "":
+        # Support: conversation, delta, delta_encoding, or unnamed events
+        if event.event not in ("conversation", "delta", "delta_encoding", ""):
             continue
 
         if not event.data or event.data == "[DONE]":
@@ -98,9 +102,78 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
         except json.JSONDecodeError:
             continue
 
-        msg = data.get("message") or data.get("v") or {}
+        # Skip non-dict payloads (e.g. delta_encoding "v1")
+        if not isinstance(data, dict):
+            continue
+
+        # --- JSON Patch incremental delta ---
+        # e.g. {"p": "/message/content/parts/0", "o": "append", "v": "Hello"}
+        if "p" in data and "o" in data and "v" in data:
+            patch_value = data["v"]
+            conv_id = data.get("conversation_id", "")
+            msg_id = data.get("message_id", "")
+            key = f"{conv_id}:{msg_id}"
+            if key not in accumulators:
+                accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id}
+            # Track accumulation for full-message fallback, but yield only the delta
+            if isinstance(patch_value, str):
+                accumulators[key]["text"] += patch_value
+                yield ChatMessage(
+                    message_id=msg_id,
+                    conversation_id=conv_id,
+                    role="assistant",
+                    content=patch_value,
+                )
+            elif isinstance(patch_value, list) and data.get("o") == "patch":
+                # Batch patch: v is a list of patch operations
+                for sub_patch in patch_value:
+                    if isinstance(sub_patch, dict) and "p" in sub_patch and "o" in sub_patch and "v" in sub_patch:
+                        sub_val = sub_patch["v"]
+                        sub_path = sub_patch.get("p", "")
+                        if isinstance(sub_val, str) and "parts/0" in sub_path:
+                            accumulators[key]["text"] += sub_val
+                            yield ChatMessage(
+                                message_id=msg_id,
+                                conversation_id=conv_id,
+                                role="assistant",
+                                content=sub_val,
+                            )
+                        elif sub_path == "/message/status" and sub_val == "finished_successfully":
+                            yield ChatMessage(
+                                message_id=msg_id,
+                                conversation_id=conv_id,
+                                role="assistant",
+                                content="",
+                                finish_reason="stop",
+                            )
+            continue
+
+        # --- Simple string delta ---
+        # e.g. {"v": " do this carefully, step"}
+        if "v" in data and not isinstance(data.get("v"), dict):
+            patch_value = data["v"]
+            conv_id = data.get("conversation_id", "")
+            msg_id = data.get("message_id", "")
+            key = f"{conv_id}:{msg_id}"
+            if key not in accumulators:
+                accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id}
+            if isinstance(patch_value, str):
+                accumulators[key]["text"] += patch_value
+                yield ChatMessage(
+                    message_id=msg_id,
+                    conversation_id=conv_id,
+                    role="assistant",
+                    content=patch_value,
+                )
+            continue
+
+        # --- Full message update (nested under data["v"] or data["message"]) ---
+        msg = data.get("message") or {}
+        if not msg and isinstance(data.get("v"), dict):
+            msg = data.get("v", {}).get("message", {})
+
         if not msg:
-            # Check for error
+            # Check for error at top level
             if data.get("error"):
                 yield ChatMessage(finish_reason="error", content=str(data["error"]))
                 return
@@ -109,8 +182,16 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
         message_id = msg.get("id") or data.get("message_id", "")
         conversation_id = data.get("conversation_id", "")
         role = (msg.get("author") or {}).get("role", "")
+        # Skip non-assistant messages (user/system echoes in SSE stream)
+        if role not in ("assistant", ""):
+            continue
         content_parts = (msg.get("content") or {}).get("parts", [])
         model = msg.get("model", "") or data.get("model", "")
+
+        # Update accumulator for this message so incremental deltas build on it
+        key = f"{conversation_id}:{message_id}"
+        if key not in accumulators:
+            accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conversation_id}
 
         # Check for image
         is_image = False
@@ -127,30 +208,32 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
                     if part.startswith("file-service://") or part.startswith("sediment://"):
                         asset_pointer = part
 
-        # Build text content
+        # Build text content from parts
         text_parts = []
         for part in content_parts:
             if isinstance(part, str):
                 text_parts.append(part)
             elif isinstance(part, dict):
-                # Image or other complex content
                 if part.get("asset_pointer"):
                     if not asset_pointer:
                         asset_pointer = part["asset_pointer"]
                     is_image = True
         content = "".join(text_parts)
+        if content:
+            accumulators[key]["text"] = content
 
         # Finish reason
         finish = data.get("finish_reason", "")
         if not finish and msg.get("finish_details"):
             finish = msg["finish_details"].get("type", "")
 
-        if content or is_image or finish:
+        # Only emit if there's actual content or a finish signal
+        if accumulators[key]["text"] or is_image or finish:
             yield ChatMessage(
                 message_id=message_id,
                 conversation_id=conversation_id,
                 role=role,
-                content=content,
+                content=accumulators[key]["text"],
                 model=model,
                 finish_reason=finish,
                 is_image=is_image,

@@ -230,7 +230,7 @@ class ChatGPTClient:
         if proof_token:
             headers["Openai-Sentinel-Proof-Token"] = proof_token
         if conduit_token:
-            headers["X-Conduit-Token"] = conduit_token
+            headers["Openai-Sentinel-Conduit-Api-Token"] = conduit_token
 
         resp = curl_requests.post(
             f"{BASE_URL}{path}", headers=headers, json=payload,

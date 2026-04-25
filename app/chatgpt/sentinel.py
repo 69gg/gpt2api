@@ -342,7 +342,9 @@ class SentinelClient:
                 ts_resp = self._solve_turnstile(prep.get("turnstile", {}).get("dx", ""))
                 if not ts_resp:
                     logger.warning("Turnstile required but solver failed, falling back to single-step")
-                    return self.chat_requirements_single()
+                    # Do NOT return here — let execution fall through to single-step
+                    # fallback below so POW is also solved if needed.
+                    raise RuntimeError("Turnstile solver failed, use single-step fallback")
 
             # Finalize
             token, final_persona = self.chat_requirements_finalize(prep_token, proof, ts_resp)

@@ -33,14 +33,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from curl_cffi import requests
 
 # ==================== 常量 ====================
-BASE_DIR = Path(__file__).parent.resolve()
+BASE_DIR = Path(__file__).parent.parent.resolve()
 WEB_TOKEN_DIR = BASE_DIR / "web_token"
 
 AUTH_URL = "https://auth.openai.com/oauth/authorize"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 
-CLIENT_ID_PLATFORM = "app_2SKx67EdpoN0G6j64rFvigXD"
-REDIRECT_URI_PLATFORM = "https://platform.openai.com/auth/callback"
+CLIENT_ID_CODEX = "app_EMoamEEZ73f0CkXaXp7hrann"
+REDIRECT_URI_CODEX = "http://localhost:1455/auth/callback"
 DEFAULT_SCOPE = "openid email profile offline_access"
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.112 Safari/537.36"
@@ -293,17 +293,20 @@ class CFEmailProvider:
 
         raise RuntimeError("create_email failed after 5 attempts")
 
-    def snapshot_mail_ids(self, jwt: str) -> set:
+    def snapshot_mail_ids(self, jwt: str) -> set[str]:
         url = f"{self.cf_url}/api/mails?limit=20&offset=0"
         h = self._headers(address_jwt=jwt)
-        resp = requests.get(url, headers=h, proxies=self.proxies,
-                            timeout=15, impersonate="chrome136")
-        if resp.status_code != 200:
-            return set()
-        emails = resp.json()
-        results = emails.get("results") if isinstance(emails, dict) else emails
-        if isinstance(results, list):
-            return {str(e.get("id", "")) for e in results if e.get("id")}
+        try:
+            resp = requests.get(url, headers=h, proxies=self.proxies,
+                                timeout=30, impersonate="chrome136")
+            if resp.status_code != 200:
+                return set()
+            emails = resp.json()
+            results = emails.get("results") if isinstance(emails, dict) else emails
+            if isinstance(results, list):
+                return {str(e.get("id", "")) for e in results if e.get("id")}
+        except Exception:
+            pass
         return set()
 
     def wait_for_code(self, email: str, jwt: str, timeout: int = 90,
@@ -560,8 +563,8 @@ class FlowContext:
     auth_url: str = ""
     auth_state: str = ""
     code_verifier: str = ""
-    redirect_uri: str = REDIRECT_URI_PLATFORM
-    client_id: str = CLIENT_ID_PLATFORM
+    redirect_uri: str = "https://platform.openai.com/auth/callback"
+    client_id: str = "app_2SKx67EdpoN0G6j64rFvigXD"
     email: str = ""
     email_jwt: str = ""
     password: str = ""
@@ -952,77 +955,20 @@ def register_account(session, context: FlowContext, email_provider: CFEmailProvi
     page_type = str((((create_json or {}).get("page") or {}).get("type")) or "").strip()
     _debug(f"Create account page_type={page_type}, continue_url={continue_url[:80] if continue_url else '-'}")
 
-    # Step 7: OAuth token exchange
-    _log("[08] Exchanging OAuth token...")
+    # Step 7: Get OAuth token via Platform OAuth (continue_url)
+    _log("[08] Getting Platform OAuth token...")
     token_data = None
-
-    # Strategy A: Use continue_url from create_account to follow redirect chain
     if continue_url:
         token_data = _follow_continue_url_for_token(
             session, context, continue_url, proxies=proxies,
         )
-        if token_data:
-            _log("  Token obtained via continue_url!")
-
-    # Strategy B: Try workspace/select if we have workspace_id in auth session cookie
     if not token_data:
-        workspace_id = _extract_workspace_id(session)
-        if workspace_id:
-            _log(f"  Found workspace_id, selecting...")
-            token_data = _select_workspace_and_exchange(
-                session, context, workspace_id, proxies=proxies,
-            )
-            if token_data:
-                _log("  Token obtained via workspace/select!")
+        raise RuntimeError("Failed to obtain Platform OAuth token")
 
-    # Strategy C: Re-bootstrap OAuth with Codex client_id and follow redirects
-    if not token_data:
-        _log("  Trying Codex OAuth re-bootstrap...")
-        c_auth_url, c_state, c_verifier = _build_oauth_authorize_url(
-            client_id="app_EMoamEEZ73f0CkXaXp7hrann",
-            redirect_uri="http://localhost:1455/auth/callback",
-            prompt="none",
-        )
-        c_code, c_final = _oauth_follow_for_code(
-            session, c_auth_url, referer="https://auth.openai.com/",
-            user_agent=context.user_agent, impersonate=context.impersonate,
-        )
-        if c_code:
-            try:
-                token_data = _exchange_code_for_token(
-                    session, c_code, c_state, c_verifier,
-                    "app_EMoamEEZ73f0CkXaXp7hrann",
-                    "http://localhost:1455/auth/callback",
-                    proxies=proxies, email=context.email, password=context.password,
-                )
-            except Exception as exc:
-                _log(f"  Codex token exchange failed: {exc}", "!")
-
-    # Strategy D: Platform OAuth with prompt=login
-    if not token_data:
-        _log("  Trying Platform OAuth...")
-        auth_url, p_state, p_verifier = _build_oauth_authorize_url(
-            client_id=CLIENT_ID_PLATFORM, redirect_uri=REDIRECT_URI_PLATFORM, prompt="login"
-        )
-        p_code, p_final = _oauth_follow_for_code(
-            session, auth_url, referer="https://auth.openai.com/",
-            user_agent=context.user_agent, impersonate=context.impersonate,
-        )
-        if p_code:
-            try:
-                token_data = _exchange_code_for_token(
-                    session, p_code, p_state, p_verifier,
-                    CLIENT_ID_PLATFORM, REDIRECT_URI_PLATFORM,
-                    proxies=proxies, email=context.email, password=context.password,
-                )
-            except Exception as exc:
-                _log(f"  Platform token exchange failed: {exc}", "!")
-
-    if not token_data:
-        raise RuntimeError("Failed to obtain OAuth token")
-
-    _log("  Token obtained successfully!")
+    _log("  Platform token obtained!")
     return token_data
+
+
 
 
 def _follow_continue_url_for_token(
@@ -1048,12 +994,14 @@ def _follow_continue_url_for_token(
 
     for _ in range(max_redirects):
         try:
+            _debug(f"[follow-continue] GET {current_url[:80]}...")
             resp = session.get(current_url, headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Upgrade-Insecure-Requests": "1",
                 "User-Agent": context.user_agent,
                 "Referer": "https://auth.openai.com/about-you",
             }, allow_redirects=False, timeout=30, impersonate=context.impersonate)
+            _debug(f"[follow-continue] status={resp.status_code} loc={resp.headers.get('Location', '')[:80]}")
         except Exception as exc:
             # curl_cffi throws on localhost redirect — extract code from error
             maybe = re.search(r'(https?://localhost[^\s\'"]+)', str(exc))
@@ -1279,8 +1227,8 @@ def main() -> None:
 
     context = FlowContext(
         fingerprint=fp,
-        redirect_uri=REDIRECT_URI_PLATFORM,
-        client_id=CLIENT_ID_PLATFORM,
+        redirect_uri="https://platform.openai.com/auth/callback",
+        client_id="app_2SKx67EdpoN0G6j64rFvigXD",
     )
     context.did = str(uuid.uuid4())
     session.cookies.set("oai-did", context.did, domain="chatgpt.com")
