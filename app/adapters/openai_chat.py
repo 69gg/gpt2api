@@ -191,7 +191,7 @@ class OpenAIChatAdapter:
                     client, result.conversation_id, result.message_id, max_wait=60)
             if image_url:
                 logger.info(f"Chat [{token.email}]: image resolved, url={image_url[:80]}")
-                content += f"\n\n![image]({image_url})"
+                content = f"![image]({image_url})"
             elif result.is_image:
                 logger.warning(f"Chat [{token.email}]: image detected but URL resolution failed")
 
