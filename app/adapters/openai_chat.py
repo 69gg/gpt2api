@@ -84,6 +84,29 @@ class OpenAIChatAdapter:
             pow_max_iter=self.pow_max_iter,
         )
 
+    def _poll_conv_for_image(self, client: ChatGPTClient, conv_id: str,
+                             msg_id: str, max_wait: int = 120) -> str:
+        """Poll /backend-api/conversation/{id} for async image generation.
+
+        When ChatGPT generates an image via regular chat, the SSE stream
+        only returns the revised prompt text. The actual image appears
+        asynchronously in the conversation. This method polls until the
+        image asset_pointer or URL is found.
+        """
+        from app.chatgpt.image import ImageClient
+        from app.adapters.openai_image import _make_proxy_url
+
+        img_client = ImageClient(client)
+        img_client._last_conv_id = conv_id
+
+        # Poll for image URL
+        image_url = img_client._poll_for_image(conv_id, msg_id, "", max_wait=max_wait)
+
+        if image_url and self.deployment_url:
+            image_url = _make_proxy_url(image_url, self.deployment_url)
+
+        return image_url
+
     def _resolve_image_url(self, client: ChatGPTClient, conv_id: str,
                            msg_id: str, asset_pointer: str) -> str:
         """Resolve an asset_pointer to a downloadable image URL.
@@ -154,17 +177,23 @@ class OpenAIChatAdapter:
             logger.info(f"Chat [{token.email}]: finished, content_len={len(result.content)}, finish={result.finish_reason}, is_image={result.is_image}")
 
             content = result.content
-            # If image was generated, resolve the image URL and append it
-            if result.is_image and (result.asset_pointer or result.image_url):
-                image_url = result.image_url
-                if not image_url and result.asset_pointer:
-                    image_url = self._resolve_image_url(
-                        client, result.conversation_id, result.message_id, result.asset_pointer)
-                if image_url:
-                    logger.info(f"Chat [{token.email}]: image resolved, url={image_url[:80]}")
-                    content += f"\n\n![image]({image_url})"
-                else:
-                    logger.warning(f"Chat [{token.email}]: image detected but URL resolution failed")
+            # If image was generated, resolve the image URL and append it.
+            # Image generation is asynchronous: the SSE stream returns the
+            # revised prompt text, but the image asset appears later in the
+            # conversation. Poll for it using the conversation_id.
+            image_url = result.image_url
+            if not image_url and result.asset_pointer:
+                image_url = self._resolve_image_url(
+                    client, result.conversation_id, result.message_id, result.asset_pointer)
+            if not image_url and result.conversation_id:
+                logger.info(f"Chat [{token.email}]: polling conversation for async image, conv={result.conversation_id}")
+                image_url = self._poll_conv_for_image(
+                    client, result.conversation_id, result.message_id, max_wait=60)
+            if image_url:
+                logger.info(f"Chat [{token.email}]: image resolved, url={image_url[:80]}")
+                content += f"\n\n![image]({image_url})"
+            elif result.is_image:
+                logger.warning(f"Chat [{token.email}]: image detected but URL resolution failed")
 
             token.record_success()
             token.save()
@@ -269,35 +298,41 @@ class OpenAIChatAdapter:
                     asset_pointer = msg.asset_pointer
 
                 if msg.finish_reason in ("stop", "error"):
-                    # If image was generated, resolve URL and stream it before finishing
-                    if has_image and (asset_pointer or image_url_direct):
-                        image_url = image_url_direct
-                        if not image_url and asset_pointer:
-                            logger.info(f"Stream [{token.email}]: resolving image asset={asset_pointer[:50]}")
-                            image_url = self._resolve_image_url(client, conv_id, msg_id, asset_pointer)
-                        if image_url:
-                            logger.info(f"Stream [{token.email}]: image resolved, url={image_url[:80]}")
-                            img_chunk = {
-                                "id": chat_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{"index": 0, "delta": {"content": f"\n\n![image]({image_url})"}, "finish_reason": None}],
-                            }
-                            yield f"data: {json.dumps(img_chunk)}\n\n"
-                        else:
-                            logger.warning(f"Stream [{token.email}]: image detected but URL resolution failed")
-
-                    logger.info(f"Stream [{token.email}]: finished, content_len={content_len}, finish={msg.finish_reason}, has_image={has_image}")
-                    finish_chunk = {
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    }
-                    yield f"data: {json.dumps(finish_chunk)}\n\n"
                     break
+
+            # After stream ends, check for async image generation.
+            # ChatGPT image gen is asynchronous: the SSE stream returns the
+            # revised prompt text and finishes, but the image appears later
+            # in the conversation. Poll for it if we have a conversation_id.
+            image_url = image_url_direct
+            if not image_url and has_image and asset_pointer:
+                logger.info(f"Stream [{token.email}]: resolving image asset={asset_pointer[:50]}")
+                image_url = self._resolve_image_url(client, conv_id, msg_id, asset_pointer)
+
+            if not image_url and conv_id:
+                logger.info(f"Stream [{token.email}]: polling conversation for async image, conv={conv_id}")
+                image_url = self._poll_conv_for_image(client, conv_id, msg_id)
+
+            if image_url:
+                logger.info(f"Stream [{token.email}]: image resolved, url={image_url[:80]}")
+                img_chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": f"\n\n![image]({image_url})"}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(img_chunk)}\n\n"
+
+            logger.info(f"Stream [{token.email}]: finished, content_len={content_len}, has_image={bool(image_url)}")
+            finish_chunk = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(finish_chunk)}\n\n"
 
             token.record_success()
             token.save()
