@@ -3,6 +3,7 @@ OpenAI /v1/images/generations adapter — image generation via ChatGPT Web Chat.
 """
 from __future__ import annotations
 
+import base64
 import json
 import time
 import uuid
@@ -15,15 +16,25 @@ from app.chatgpt.image import ImageClient, ImageResult
 from app.token_manager import TokenManager, TokenInfo, FailReason
 
 
+def _make_proxy_url(estuary_url: str, deployment_url: str) -> str:
+    """Convert an estuary URL to a proxied URL through the deployment."""
+    if not deployment_url or not estuary_url:
+        return estuary_url
+    encoded = base64.urlsafe_b64encode(estuary_url.encode()).decode().rstrip("=")
+    return f"{deployment_url.rstrip('/')}/p/img/{encoded}"
+
+
 class OpenAIImageAdapter:
     """Adapts OpenAI /v1/images/generations requests to ChatGPT Web image generation."""
 
     def __init__(self, token_manager: TokenManager, proxy: str = "",
-                 turnstile_solver_url: str = "", pow_max_iter: int = 500000):
+                 turnstile_solver_url: str = "", pow_max_iter: int = 500000,
+                 deployment_url: str = ""):
         self.token_manager = token_manager
         self.proxy = proxy
         self.turnstile_solver_url = turnstile_solver_url
         self.pow_max_iter = pow_max_iter
+        self.deployment_url = deployment_url
 
     def _create_client(self, token: TokenInfo) -> ImageClient:
         if not token.user_agent or not token.impersonate:
@@ -34,13 +45,14 @@ class OpenAIImageAdapter:
         else:
             user_agent = token.user_agent
             impersonate = token.impersonate
+        effective_proxy = token.get_proxy(self.proxy)
         chat_client = ChatGPTClient(
             access_token=token.access_token,
             device_id=token.device_id,
             session_id=token.session_id,
             user_agent=user_agent,
             impersonate=impersonate,
-            proxy=self.proxy,
+            proxy=effective_proxy,
             turnstile_solver_url=self.turnstile_solver_url,
             pow_max_iter=self.pow_max_iter,
         )
@@ -81,16 +93,22 @@ class OpenAIImageAdapter:
             token.save()
 
             images = []
+            proxied_url = _make_proxy_url(result.image_url, self.deployment_url)
             image_data = {
-                "url": result.image_url,
+                "url": proxied_url,
                 "revised_prompt": result.revised_prompt or prompt,
             }
             if response_format == "b64_json":
-                # Try to download and convert to base64
+                # Try to download and convert to base64 using token proxy
                 try:
                     from curl_cffi import requests as curl_requests
-                    import base64
-                    resp = curl_requests.get(result.image_url, timeout=30)
+                    effective_proxy = token.get_proxy(self.proxy)
+                    proxies = {"http": effective_proxy, "https": effective_proxy} if effective_proxy else None
+                    resp = curl_requests.get(
+                        result.image_url, timeout=30, proxies=proxies,
+                        impersonate=token.impersonate or "chrome136",
+                        headers={"Referer": "https://chatgpt.com/"},
+                    )
                     if resp.status_code == 200:
                         image_data = {
                             "b64_json": base64.b64encode(resp.content).decode("ascii"),

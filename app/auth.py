@@ -21,8 +21,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         path = request.url.path
 
-        # Skip auth for health check and models list
-        if path in ("/health", "/v1/models") or path.startswith("/docs") or path.startswith("/openapi"):
+        # Skip auth for health check, models list, and image proxy
+        if path in ("/health", "/v1/models") or path.startswith("/docs") or path.startswith("/openapi") or path.startswith("/p/img/"):
             return await call_next(request)
 
         # Admin endpoints require admin key

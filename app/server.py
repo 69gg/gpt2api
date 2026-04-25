@@ -19,7 +19,7 @@ from app.adapters.openai_chat import OpenAIChatAdapter
 from app.adapters.openai_resp import OpenAIResponseAdapter
 from app.adapters.anthropic import AnthropicAdapter
 from app.adapters.openai_image import OpenAIImageAdapter
-from app.routes import chat, response, messages, models, admin
+from app.routes import chat, response, messages, models, admin, proxy
 
 
 @asynccontextmanager
@@ -51,10 +51,12 @@ async def lifespan(app: FastAPI):
     )
     resp_adapter = OpenAIResponseAdapter(chat_adapter)
     anthropic_adapter = AnthropicAdapter(chat_adapter)
+    deployment_url = get_config("server.deployment_url", "")
     image_adapter = OpenAIImageAdapter(
         token_manager=tm, proxy=proxy,
         turnstile_solver_url=turnstile_solver_url,
         pow_max_iter=pow_max_iter,
+        deployment_url=deployment_url,
     )
 
     # Store in app state
@@ -63,6 +65,7 @@ async def lifespan(app: FastAPI):
     app.state.resp_adapter = resp_adapter
     app.state.anthropic_adapter = anthropic_adapter
     app.state.image_adapter = image_adapter
+    app.state.deployment_url = get_config("server.deployment_url", "")
 
     # Start background tasks
     tasks = []
@@ -207,6 +210,7 @@ def create_app() -> FastAPI:
     app.include_router(messages.router)
     app.include_router(models.router)
     app.include_router(admin.router)
+    app.include_router(proxy.router)
 
     # Health check
     @app.get("/health")

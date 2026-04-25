@@ -34,8 +34,20 @@ async def list_tokens(request: Request):
             "last_fail_reason": t.last_fail_reason,
             "last_used_at": t.last_used_at,
             "cooldown_until": t.cooldown_until,
+            "proxy": t.proxy,
         })
     return JSONResponse(content={"tokens": tokens, "stats": tm.get_stats()})
+
+
+@router.post("/tokens")
+async def add_token(request: Request):
+    """Add a new token to the pool."""
+    body = await request.json()
+    tm = _get_tm(request)
+    from app.token_manager import TokenInfo
+    token = TokenInfo.from_dict(body)
+    tm.add_token(token)
+    return JSONResponse(content={"ok": True, "email": token.email, "status": token.status.value})
 
 
 @router.post("/tokens/{email}/disable")

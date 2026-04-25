@@ -684,7 +684,7 @@ def _post_form(url: str, data: Dict[str, str], proxies: Any = None,
 def _build_token_json(*, access_token: str, refresh_token: str,
                       id_token: str = "", client_id: str = "",
                       expires_in: int = 0, email: str = "",
-                      password: str = "") -> Dict[str, Any]:
+                      password: str = "", proxy: str = "") -> Dict[str, Any]:
     claims = _jwt_claims_no_verify(id_token)
     access_claims = _jwt_claims_no_verify(access_token)
 
@@ -727,15 +727,16 @@ def _build_token_json(*, access_token: str, refresh_token: str,
         "daily_quota_total": None,
         "image_quota_remaining": None,
         "image_quota_total": None,
-        "device_id": "",
-        "session_id": "",
+        "user_agent": "",
+        "impersonate": "",
+        "proxy": proxy,
     }
 
 
 def _exchange_code_for_token(session, code: str, state: str, code_verifier: str,
                              client_id: str, redirect_uri: str,
                              proxies: Any = None, email: str = "",
-                             password: str = "") -> Dict[str, Any]:
+                             password: str = "", proxy: str = "") -> Dict[str, Any]:
     token_resp = _post_form(TOKEN_URL, {
         "grant_type": "authorization_code",
         "client_id": client_id,
@@ -752,12 +753,13 @@ def _exchange_code_for_token(session, code: str, state: str, code_verifier: str,
         expires_in=_to_int(token_resp.get("expires_in")),
         email=email,
         password=password,
+        proxy=proxy,
     )
 
 
 # ==================== Registration Flow ====================
 def register_account(session, context: FlowContext, email_provider: CFEmailProvider,
-                     proxies: Any = None) -> Dict[str, Any]:
+                     proxies: Any = None, proxy: str = "") -> Dict[str, Any]:
     """Run the full registration flow and return token dict."""
 
     # Step 1: Prepare OAuth runtime
@@ -962,7 +964,7 @@ def register_account(session, context: FlowContext, email_provider: CFEmailProvi
     token_data = None
     if continue_url:
         token_data = _follow_continue_url_for_token(
-            session, context, continue_url, proxies=proxies,
+            session, context, continue_url, proxies=proxies, proxy=proxy,
         )
     if not token_data:
         raise RuntimeError("Failed to obtain Platform OAuth token")
@@ -974,6 +976,7 @@ def register_account(session, context: FlowContext, email_provider: CFEmailProvi
         token_data["impersonate"] = getattr(context.fingerprint, "impersonate", "")
         token_data["device_id"] = context.did
         token_data["session_id"] = str(uuid.uuid4())
+        token_data["proxy"] = proxy
     return token_data
 
 
@@ -981,7 +984,7 @@ def register_account(session, context: FlowContext, email_provider: CFEmailProvi
 
 def _follow_continue_url_for_token(
     session, context, continue_url: str, *,
-    proxies: Any = None, max_redirects: int = 15,
+    proxies: Any = None, proxy: str = "", max_redirects: int = 15,
 ) -> Optional[Dict[str, Any]]:
     """Follow the continue_url redirect chain to extract OAuth code and exchange for token.
     Handles OIDC hybrid flow where callback URL contains #code=... fragment.
@@ -996,6 +999,7 @@ def _follow_continue_url_for_token(
                 session, code, context.auth_state, context.code_verifier,
                 context.client_id, context.redirect_uri,
                 proxies=proxies, email=context.email, password=context.password,
+                proxy=proxy,
             )
         except Exception:
             pass
@@ -1162,7 +1166,7 @@ def _select_workspace_and_exchange(
         return None
 
     return _follow_continue_url_for_token(
-        session, context, continue_url, proxies=proxies,
+        session, context, continue_url, proxies=proxies, proxy=proxy,
     )
 
 

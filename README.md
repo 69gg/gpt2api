@@ -62,8 +62,11 @@ token:
   fail_threshold: 5                # 失败多少次标记为 dead
   load_balance: "round-robin"      # 负载策略: round-robin / random / least-used
 
+server:
+  deployment_url: ""                # gpt2api 部署 URL（用于图片代理，如 https://your-domain.com）
+
 chatgpt:
-  proxy: ""                        # 全局代理
+  proxy: ""                        # 全局代理（每个 token 的 proxy 字段优先）
   sse_timeout: 120
   pow_max_iter: 500000
   image_download_timeout: 60

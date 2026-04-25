@@ -59,13 +59,14 @@ class OpenAIChatAdapter:
         else:
             user_agent = token.user_agent
             impersonate = token.impersonate
+        effective_proxy = token.get_proxy(self.proxy)
         return ChatGPTClient(
             access_token=token.access_token,
             device_id=token.device_id,
             session_id=token.session_id,
             user_agent=user_agent,
             impersonate=impersonate,
-            proxy=self.proxy,
+            proxy=effective_proxy,
             turnstile_solver_url=self.turnstile_solver_url,
             pow_max_iter=self.pow_max_iter,
         )

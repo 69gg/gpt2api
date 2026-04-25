@@ -72,6 +72,7 @@ class TokenInfo:
     image_quota_total: Optional[int] = None
     user_agent: str = ""
     impersonate: str = ""
+    proxy: str = ""  # per-token proxy (http://..., socks5://..., socks5h://...)
     _path: Optional[str] = None  # file path for persistence
 
     @staticmethod
@@ -109,6 +110,7 @@ class TokenInfo:
             image_quota_total=data.get("image_quota_total"),
             user_agent=data.get("user_agent", ""),
             impersonate=data.get("impersonate", ""),
+            proxy=data.get("proxy", ""),
             _path=path,
         )
 
@@ -140,7 +142,12 @@ class TokenInfo:
             "image_quota_total": self.image_quota_total,
             "user_agent": self.user_agent,
             "impersonate": self.impersonate,
+            "proxy": self.proxy,
         }
+
+    def get_proxy(self, global_proxy: str = "") -> str:
+        """Return effective proxy: token-level if set, otherwise global."""
+        return self.proxy if self.proxy else global_proxy
 
     @property
     def is_available(self) -> bool:

@@ -14,6 +14,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
         "port": 8000,
         "api_key": "sk-gpt2api",
         "admin_key": "admin-gpt2api",
+        "deployment_url": "",
     },
     "register": {
         "cf_url": "",
