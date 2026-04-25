@@ -15,17 +15,24 @@ from app.chatgpt.sse import ChatMessage
 from app.token_manager import TokenManager, TokenInfo, FailReason
 
 
-# Model mapping: OpenAI model name → chatgpt.com upstream model name
+# Model mapping: API model name → chatgpt.com upstream model slug
 MODEL_MAP = {
+    # Display IDs (dot notation)
+    "gpt-5.3": "gpt-5-3",
+    "gpt-5.2": "gpt-5-2",
+    "gpt-5.1": "gpt-5-1",
+    "gpt-5-mini": "gpt-5-mini",
+    "gpt-5.3-mini": "gpt-5-3-mini",
+    "gpt-5.4-mini-thinking": "gpt-5-4-t-mini",
+    "auto": "auto",
+    "research": "research",
+    # Upstream slugs (pass-through)
     "gpt-5-3": "gpt-5-3",
     "gpt-5-2": "gpt-5-2",
     "gpt-5-1": "gpt-5-1",
     "gpt-5": "gpt-5",
-    "gpt-5-mini": "gpt-5-mini",
     "gpt-5-3-mini": "gpt-5-3-mini",
     "gpt-5-4-t-mini": "gpt-5-4-t-mini",
-    "auto": "auto",
-    "research": "research",
     # Legacy aliases
     "gpt-4o": "auto",
     "gpt-4o-mini": "auto",

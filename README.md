@@ -79,13 +79,13 @@ chatgpt:
   turnstile_solver_url: ""         # 外部 Turnstile 求解器（可选）
 
 models:                             # 可用模型列表（对应 chatgpt.com 实际模型）
-  - id: "gpt-5-3"
-  - id: "gpt-5-2"
-  - id: "gpt-5-1"
+  - id: "gpt-5.3"
+  - id: "gpt-5.2"
+  - id: "gpt-5.1"
   - id: "gpt-5"
   - id: "gpt-5-mini"
-  - id: "gpt-5-3-mini"
-  - id: "gpt-5-4-t-mini"
+  - id: "gpt-5.3-mini"
+  - id: "gpt-5.4-mini-thinking"
   - id: "auto"
   - id: "research"
   - id: "gpt-image-2"
