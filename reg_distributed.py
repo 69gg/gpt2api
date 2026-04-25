@@ -8,6 +8,7 @@ Supports:
 - Infinite mode: --count 0 (or --infinite) registers forever until stopped
 - Retry on registration failure with configurable attempts and backoff
 - Retry on push failure to each instance
+- Separate proxy for registration (--reg-proxy) and token config (--token-proxy)
 
 Usage:
     # Register 5 accounts
@@ -21,6 +22,13 @@ Usage:
         --cf-url https://xxx --cf-auth xxx \
         --instances "http://host1:8000" \
         --infinite
+
+    # Different proxies: register via local, token uses remote SOCKS5
+    python reg_distributed.py \
+        --cf-url https://xxx --cf-auth xxx \
+        --instances "http://host1:8000" \
+        --reg-proxy http://127.0.0.1:7890 \
+        --token-proxy socks5://user:pass@remote:1080
 
     # With retry and interval
     python reg_distributed.py \
@@ -127,7 +135,7 @@ def register_one(email_provider: CFEmailProvider, proxies: dict | None,
             )
 
             token_data = register_account(session, context, email_provider, proxies=proxies, proxy=proxy)
-            token_data["proxy"] = proxy
+            token_data["proxy"] = token_proxy
             return token_data
         except Exception as e:
             if attempt < retry:
@@ -159,7 +167,9 @@ def main():
     parser.add_argument("--cf-auth", required=True, help="CF service auth token")
     parser.add_argument("--cf-admin-auth", default="", help="CF admin auth token")
     parser.add_argument("--cf-domain", default="", help="Email domain override")
-    parser.add_argument("--proxy", default="", help="Proxy for registration (and token default)")
+    parser.add_argument("--proxy", default="", help="Proxy for both registration and token (shorthand for --reg-proxy + --token-proxy)")
+    parser.add_argument("--reg-proxy", default="", help="Proxy used only for registration requests")
+    parser.add_argument("--token-proxy", default="", help="Proxy written into token JSON for gpt2api to use")
     parser.add_argument("--instances", required=True, help="Comma-separated gpt2api instance URLs")
     parser.add_argument("--admin-key", default="admin-gpt2api", help="Admin key for pushing tokens")
     parser.add_argument("--count", type=int, default=1, help="Number of accounts to register (0=infinite)")
@@ -180,14 +190,22 @@ def main():
         _log("No instances specified")
         sys.exit(1)
 
-    proxy = args.proxy
-    proxies = None
-    if proxy:
+    # Resolve proxies: --proxy sets both, individual flags override
+    reg_proxy = args.reg_proxy or args.proxy
+    token_proxy = args.token_proxy or args.proxy
+    reg_proxies = None
+    if reg_proxy:
         try:
-            proxy_url = _normalize_proxy_url(proxy)
-            proxies = {"http": proxy_url, "https": proxy_url}
+            proxy_url = _normalize_proxy_url(reg_proxy)
+            reg_proxies = {"http": proxy_url, "https": proxy_url}
         except ValueError as e:
-            _log(f"Invalid proxy: {e}")
+            _log(f"Invalid reg-proxy: {e}")
+            sys.exit(1)
+    if token_proxy:
+        try:
+            _normalize_proxy_url(token_proxy)
+        except ValueError as e:
+            _log(f"Invalid token-proxy: {e}")
             sys.exit(1)
 
     email_provider = CFEmailProvider(
@@ -195,7 +213,7 @@ def main():
         cf_auth=args.cf_auth,
         cf_admin_auth=args.cf_admin_auth,
         cf_domain=args.cf_domain,
-        proxies=proxies,
+        proxies=reg_proxies,
     )
 
     success = 0
@@ -204,6 +222,10 @@ def main():
 
     _log(f"Starting: {'infinite' if infinite else f'count={count}'} mode, interval={args.interval}s, "
          f"retry={args.retry}, instances={len(instances)}")
+    if reg_proxy:
+        _log(f"  Registration proxy: {reg_proxy}")
+    if token_proxy:
+        _log(f"  Token proxy: {token_proxy}")
 
     while True:
         if _shutdown:
@@ -215,7 +237,7 @@ def main():
         _log(f"{label} Registering account...")
 
         token_data = register_one(
-            email_provider, proxies, proxy,
+            email_provider, reg_proxies, reg_proxy,
             retry=args.retry, retry_delay=args.retry_delay,
         )
 

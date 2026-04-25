@@ -192,11 +192,22 @@ uv run python reg_distributed.py \
   --cf-auth xxx \
   --instances "http://host1:8000" \
   --infinite --interval 30
+
+# 分别设置注册代理和 token 代理
+uv run python reg_distributed.py \
+  --cf-url https://your-cf-email-worker.workers.dev \
+  --cf-auth xxx \
+  --instances "http://host1:8000" \
+  --reg-proxy http://127.0.0.1:7890 \
+  --token-proxy socks5://user:pass@remote:1080
 ```
 
 参数说明：
 - `--instances`: 逗号分隔的 gpt2api 部署地址
 - `--admin-key`: 管理端点密钥（用于 POST /admin/tokens）
+- `--proxy`: 同时设置注册代理和 token 代理（简写）
+- `--reg-proxy`: 仅用于注册请求的代理
+- `--token-proxy`: 写入 token JSON 的代理（gpt2api 使用该代理发请求）
 - `--count`: 注册数量（0 或 `--infinite` 为无限模式）
 - `--infinite`: 无限注册，持续运行直到 Ctrl+C
 - `--interval`: 两次注册间隔秒数（默认 10）
