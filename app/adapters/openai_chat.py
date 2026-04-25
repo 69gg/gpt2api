@@ -53,12 +53,13 @@ class OpenAIChatAdapter:
 
     def __init__(self, token_manager: TokenManager, proxy: str = "",
                  turnstile_solver_url: str = "", pow_max_iter: int = 500000,
-                 sse_timeout: int = 120):
+                 sse_timeout: int = 120, deployment_url: str = ""):
         self.token_manager = token_manager
         self.proxy = proxy
         self.turnstile_solver_url = turnstile_solver_url
         self.pow_max_iter = pow_max_iter
         self.sse_timeout = sse_timeout
+        self.deployment_url = deployment_url
 
     def _create_client(self, token: TokenInfo) -> ChatGPTClient:
         # Old tokens may not have user_agent/impersonate persisted.
@@ -82,6 +83,33 @@ class OpenAIChatAdapter:
             turnstile_solver_url=self.turnstile_solver_url,
             pow_max_iter=self.pow_max_iter,
         )
+
+    def _resolve_image_url(self, client: ChatGPTClient, conv_id: str,
+                           msg_id: str, asset_pointer: str) -> str:
+        """Resolve an asset_pointer to a downloadable image URL.
+
+        Uses ImageClient._poll_for_image and _download_asset to get the
+        final signed URL, then optionally proxies it through deployment_url.
+        """
+        from app.chatgpt.image import ImageClient
+        from app.adapters.openai_image import _make_proxy_url
+
+        img_client = ImageClient(client)
+        img_client._last_conv_id = conv_id
+
+        image_url = ""
+        # Try downloading the asset pointer directly
+        if asset_pointer:
+            image_url = img_client._download_asset(asset_pointer)
+
+        # If no URL from asset, try polling the conversation
+        if not image_url and conv_id:
+            image_url = img_client._poll_for_image(conv_id, msg_id, asset_pointer, max_wait=120)
+
+        if image_url and self.deployment_url:
+            image_url = _make_proxy_url(image_url, self.deployment_url)
+
+        return image_url
 
     def _build_messages(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """Convert OpenAI messages to ChatGPT format."""
@@ -123,7 +151,21 @@ class OpenAIChatAdapter:
         try:
             logger.info(f"Chat [{token.email}]: model={model} → upstream={upstream_model}, msgs={len(messages)}")
             result = client.chat(opts)
-            logger.info(f"Chat [{token.email}]: finished, content_len={len(result.content)}, finish={result.finish_reason}")
+            logger.info(f"Chat [{token.email}]: finished, content_len={len(result.content)}, finish={result.finish_reason}, is_image={result.is_image}")
+
+            content = result.content
+            # If image was generated, resolve the image URL and append it
+            if result.is_image and (result.asset_pointer or result.image_url):
+                image_url = result.image_url
+                if not image_url and result.asset_pointer:
+                    image_url = self._resolve_image_url(
+                        client, result.conversation_id, result.message_id, result.asset_pointer)
+                if image_url:
+                    logger.info(f"Chat [{token.email}]: image resolved, url={image_url[:80]}")
+                    content += f"\n\n![image]({image_url})"
+                else:
+                    logger.warning(f"Chat [{token.email}]: image detected but URL resolution failed")
+
             token.record_success()
             token.save()
 
@@ -134,7 +176,7 @@ class OpenAIChatAdapter:
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": result.content},
+                    "message": {"role": "assistant", "content": content},
                     "finish_reason": result.finish_reason or "stop",
                 }],
                 "usage": {
@@ -196,6 +238,12 @@ class OpenAIChatAdapter:
             yield f"data: {json.dumps(role_chunk)}\n\n"
 
             content_len = 0
+            conv_id = ""
+            msg_id = ""
+            asset_pointer = ""
+            has_image = False
+            image_url_direct = ""
+
             for msg in client.chat_stream(opts):
                 if msg.content:
                     content_len += len(msg.content)
@@ -208,8 +256,39 @@ class OpenAIChatAdapter:
                     }
                     yield f"data: {json.dumps(content_chunk)}\n\n"
 
+                # Track image metadata from SSE
+                if msg.conversation_id:
+                    conv_id = msg.conversation_id
+                if msg.message_id:
+                    msg_id = msg.message_id
+                if msg.is_image:
+                    has_image = True
+                    if msg.image_url:
+                        image_url_direct = msg.image_url
+                if msg.asset_pointer:
+                    asset_pointer = msg.asset_pointer
+
                 if msg.finish_reason in ("stop", "error"):
-                    logger.info(f"Stream [{token.email}]: finished, content_len={content_len}, finish={msg.finish_reason}")
+                    # If image was generated, resolve URL and stream it before finishing
+                    if has_image and (asset_pointer or image_url_direct):
+                        image_url = image_url_direct
+                        if not image_url and asset_pointer:
+                            logger.info(f"Stream [{token.email}]: resolving image asset={asset_pointer[:50]}")
+                            image_url = self._resolve_image_url(client, conv_id, msg_id, asset_pointer)
+                        if image_url:
+                            logger.info(f"Stream [{token.email}]: image resolved, url={image_url[:80]}")
+                            img_chunk = {
+                                "id": chat_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"content": f"\n\n![image]({image_url})"}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(img_chunk)}\n\n"
+                        else:
+                            logger.warning(f"Stream [{token.email}]: image detected but URL resolution failed")
+
+                    logger.info(f"Stream [{token.email}]: finished, content_len={content_len}, finish={msg.finish_reason}, has_image={has_image}")
                     finish_chunk = {
                         "id": chat_id,
                         "object": "chat.completion.chunk",

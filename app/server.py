@@ -44,14 +44,15 @@ async def lifespan(app: FastAPI):
     tm.load()
 
     # Initialize adapters
+    deployment_url = get_config("server.deployment_url", "")
     chat_adapter = OpenAIChatAdapter(
         token_manager=tm, proxy=proxy,
         turnstile_solver_url=turnstile_solver_url,
         pow_max_iter=pow_max_iter, sse_timeout=sse_timeout,
+        deployment_url=deployment_url,
     )
     resp_adapter = OpenAIResponseAdapter(chat_adapter)
     anthropic_adapter = AnthropicAdapter(chat_adapter)
-    deployment_url = get_config("server.deployment_url", "")
     image_adapter = OpenAIImageAdapter(
         token_manager=tm, proxy=proxy,
         turnstile_solver_url=turnstile_solver_url,
