@@ -87,9 +87,9 @@ models:                             # 可用模型列表（对应 chatgpt.com �
   - id: "gpt-5-3-mini"
   - id: "gpt-5-4-t-mini"
   - id: "auto"
-  # - id: "research"
-  # - id: "gpt-image-2"
-  #   type: "image"
+  - id: "research"
+  - id: "gpt-image-2"
+    type: "image"
 ```
 
 所有字段都支持用环境变量覆盖，命名规则 `GPT2API_<section>_<key>`，例如：
