@@ -48,7 +48,7 @@ def _map_model(model: str) -> str:
 
 
 def _is_image_model(model: str) -> bool:
-    return "image" in model.lower()
+    return "image" in model.lower() or "dall" in model.lower()
 
 
 class OpenAIChatAdapter:
@@ -193,14 +193,23 @@ class OpenAIChatAdapter:
         if not messages:
             return {"error": "invalid_request", "message": "Messages cannot be empty"}
 
+        # Detect image generation model and inject picture_v2 hint + prompt
+        is_image = _is_image_model(model)
+        system_hints = ["picture_v2"] if is_image else []
+        if is_image and messages:
+            last = messages[-1]
+            if last.get("role") == "user":
+                last["content"] = f"根据以下要求生成图片：{last['content']}"
+
         opts = ChatOptions(
             messages=messages,
             model=upstream_model,
             sse_timeout=self.sse_timeout,
+            system_hints=system_hints,
         )
 
         try:
-            logger.info(f"Chat [{token.email}]: model={model} → upstream={upstream_model}, msgs={len(messages)}, tools={bool(tools)}")
+            logger.info(f"Chat [{token.email}]: model={model} → upstream={upstream_model}, msgs={len(messages)}, tools={bool(tools)}, image={is_image}")
             result = client.chat(opts)
             logger.info(f"Chat [{token.email}]: finished, content_len={len(result.content)}, finish={result.finish_reason}, is_image={result.is_image}")
 
@@ -296,10 +305,19 @@ class OpenAIChatAdapter:
         if not messages:
             return
 
+        # Detect image generation model and inject picture_v2 hint + prompt
+        is_image = _is_image_model(model)
+        system_hints = ["picture_v2"] if is_image else []
+        if is_image and messages:
+            last = messages[-1]
+            if last.get("role") == "user":
+                last["content"] = f"根据以下要求生成图片：{last['content']}"
+
         opts = ChatOptions(
             messages=messages,
             model=upstream_model,
             sse_timeout=self.sse_timeout,
+            system_hints=system_hints,
         )
 
         # Set up tool stream parser if tools are provided
