@@ -122,6 +122,7 @@ class OpenAIImageAdapter:
             }
             if response_format == "b64_json":
                 try:
+                    from curl_cffi import requests as curl_requests
                     effective_proxy = token.get_proxy(self.proxy)
                     proxies = {"http": effective_proxy, "https": effective_proxy} if effective_proxy else None
                     resp = curl_requests.get(
@@ -134,8 +135,10 @@ class OpenAIImageAdapter:
                             "b64_json": base64.b64encode(resp.content).decode("ascii"),
                             "revised_prompt": result.revised_prompt or prompt,
                         }
-                except Exception:
-                    pass
+                    else:
+                        logger.warning(f"Edit [{token.email}]: b64 download failed: HTTP {resp.status_code}")
+                except Exception as e:
+                    logger.warning(f"Edit [{token.email}]: b64 download error: {e}")
 
             images.append(image_data)
 
@@ -196,7 +199,6 @@ class OpenAIImageAdapter:
                 "revised_prompt": result.revised_prompt or prompt,
             }
             if response_format == "b64_json":
-                # Try to download and convert to base64 using token proxy
                 try:
                     from curl_cffi import requests as curl_requests
                     effective_proxy = token.get_proxy(self.proxy)
@@ -211,8 +213,10 @@ class OpenAIImageAdapter:
                             "b64_json": base64.b64encode(resp.content).decode("ascii"),
                             "revised_prompt": result.revised_prompt or prompt,
                         }
-                except Exception:
-                    pass
+                    else:
+                        logger.warning(f"Image [{token.email}]: b64 download failed: HTTP {resp.status_code}")
+                except Exception as e:
+                    logger.warning(f"Image [{token.email}]: b64 download error: {e}")
 
             images.append(image_data)
 
