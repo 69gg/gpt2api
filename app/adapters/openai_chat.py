@@ -12,6 +12,9 @@ from loguru import logger
 
 from app.chatgpt.client import ChatGPTClient, ChatOptions, ChatResult
 from app.chatgpt.sse import ChatMessage
+from app.chatgpt.tool_call import (
+    build_tool_prompt, format_tool_history, parse_tool_calls, ToolCallStreamParser,
+)
 from app.token_manager import TokenManager, TokenInfo, FailReason
 
 
@@ -134,21 +137,39 @@ class OpenAIChatAdapter:
 
         return image_url
 
-    def _build_messages(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """Convert OpenAI messages to ChatGPT format."""
+    def _build_messages(self, messages: List[Dict[str, Any]],
+                        tools: List[Dict[str, Any]] = None,
+                        tool_choice: Any = None,
+                        parallel_tool_calls: bool = True) -> List[Dict[str, Any]]:
+        """Convert OpenAI messages to ChatGPT format.
+
+        If tools are provided, tool-related messages are converted to text form
+        and a tool-calling contract prompt is prepended.
+        """
+        # Convert tool history to text form if tools are present
+        if tools:
+            messages = format_tool_history(messages)
+
         result = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if role == "system":
-                # Prepend system message as a user message with special prefix
                 result.append({"role": "user", "content": f"[System Instructions]\n{content}"})
                 result.append({"role": "assistant", "content": "Understood."})
             elif role in ("user", "assistant"):
                 result.append({"role": role, "content": content})
             elif role == "tool":
-                # Skip tool messages for web chat
+                # Already handled by format_tool_history above
                 pass
+
+        # Prepend tool prompt if tools are defined
+        if tools:
+            tool_prompt = build_tool_prompt(tools, tool_choice, parallel_tool_calls)
+            if tool_prompt:
+                result.insert(0, {"role": "user", "content": tool_prompt})
+                result.insert(1, {"role": "assistant", "content": "Understood. I will follow the tool calling contract."})
+
         return result
 
     async def chat_completion(self, request: Dict[str, Any]) -> Dict[str, Any]:
@@ -160,7 +181,14 @@ class OpenAIChatAdapter:
         client = self._create_client(token)
         model = request.get("model", "auto")
         upstream_model = _map_model(model)
-        messages = self._build_messages(request.get("messages", []))
+        tools = request.get("tools")
+        tool_choice = request.get("tool_choice")
+        parallel_tool_calls = request.get("parallel_tool_calls", True)
+        messages = self._build_messages(
+            request.get("messages", []),
+            tools=tools, tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+        )
 
         if not messages:
             return {"error": "invalid_request", "message": "Messages cannot be empty"}
@@ -172,15 +200,12 @@ class OpenAIChatAdapter:
         )
 
         try:
-            logger.info(f"Chat [{token.email}]: model={model} → upstream={upstream_model}, msgs={len(messages)}")
+            logger.info(f"Chat [{token.email}]: model={model} → upstream={upstream_model}, msgs={len(messages)}, tools={bool(tools)}")
             result = client.chat(opts)
             logger.info(f"Chat [{token.email}]: finished, content_len={len(result.content)}, finish={result.finish_reason}, is_image={result.is_image}")
 
             content = result.content
             # If image was generated, resolve the image URL and append it.
-            # Image generation is asynchronous: the SSE stream returns the
-            # revised prompt text, but the image asset appears later in the
-            # conversation. Poll for it using the conversation_id.
             image_url = result.image_url
             if not image_url and result.asset_pointer:
                 image_url = self._resolve_image_url(
@@ -195,8 +220,23 @@ class OpenAIChatAdapter:
             elif result.is_image:
                 logger.warning(f"Chat [{token.email}]: image detected but URL resolution failed")
 
+            # Parse tool calls if tools were provided
+            finish_reason = result.finish_reason or "stop"
+            tool_calls_result = None
+            if tools and tool_choice != "none":
+                text_content, tool_calls_list = parse_tool_calls(content, tools)
+                if tool_calls_list:
+                    tool_calls_result = tool_calls_list
+                    content = text_content  # May be None
+                    finish_reason = "tool_calls"
+                    logger.info(f"Chat [{token.email}]: parsed {len(tool_calls_list)} tool call(s)")
+
             token.record_success()
             token.save()
+
+            message_obj = {"role": "assistant", "content": content}
+            if tool_calls_result:
+                message_obj["tool_calls"] = tool_calls_result
 
             return {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
@@ -205,8 +245,8 @@ class OpenAIChatAdapter:
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": content},
-                    "finish_reason": result.finish_reason or "stop",
+                    "message": message_obj,
+                    "finish_reason": finish_reason,
                 }],
                 "usage": {
                     "prompt_tokens": 0,
@@ -241,10 +281,17 @@ class OpenAIChatAdapter:
         client = self._create_client(token)
         model = request.get("model", "auto")
         upstream_model = _map_model(model)
-        messages = self._build_messages(request.get("messages", []))
+        tools = request.get("tools")
+        tool_choice = request.get("tool_choice")
+        parallel_tool_calls = request.get("parallel_tool_calls", True)
+        messages = self._build_messages(
+            request.get("messages", []),
+            tools=tools, tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+        )
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         created = int(time.time())
-        logger.info(f"Stream [{token.email}]: model={model} → upstream={upstream_model}, msgs={len(messages)}")
+        logger.info(f"Stream [{token.email}]: model={model} → upstream={upstream_model}, msgs={len(messages)}, tools={bool(tools)}")
 
         if not messages:
             return
@@ -254,6 +301,20 @@ class OpenAIChatAdapter:
             model=upstream_model,
             sse_timeout=self.sse_timeout,
         )
+
+        # Set up tool stream parser if tools are provided
+        tool_stream_enabled = bool(tools) and tool_choice != "none"
+        tool_parser = ToolCallStreamParser(tools) if tool_stream_enabled else None
+        tool_calls_seen = False
+        tool_call_index = 0
+
+        def _with_tool_index(tc: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal tool_call_index
+            if tc.get("index") is None:
+                tc = dict(tc)
+                tc["index"] = tool_call_index
+                tool_call_index += 1
+            return tc
 
         try:
             # First yield role delta
@@ -272,18 +333,51 @@ class OpenAIChatAdapter:
             asset_pointer = ""
             has_image = False
             image_url_direct = ""
+            content_emitted = False
 
             for msg in client.chat_stream(opts):
                 if msg.content:
-                    content_len += len(msg.content)
-                    content_chunk = {
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {"content": msg.content}, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(content_chunk)}\n\n"
+                    if tool_parser:
+                        # Once we've seen tool calls, discard remaining text
+                        if tool_calls_seen:
+                            continue
+                        # Feed through tool parser
+                        allow_calls = not content_emitted
+                        for kind, payload in tool_parser.feed(msg.content, allow_calls=allow_calls):
+                            if kind == "tool":
+                                indexed_tc = _with_tool_index(payload)
+                                tool_calls_seen = True
+                                tc_chunk = {
+                                    "id": chat_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {"tool_calls": [indexed_tc]}, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(tc_chunk)}\n\n"
+                            else:
+                                # Text content before tool calls
+                                if isinstance(payload, str) and payload.strip():
+                                    content_emitted = True
+                                content_len += len(payload)
+                                content_chunk = {
+                                    "id": chat_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {"content": payload}, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(content_chunk)}\n\n"
+                    else:
+                        content_len += len(msg.content)
+                        content_chunk = {
+                            "id": chat_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": msg.content}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(content_chunk)}\n\n"
 
                 # Track image metadata from SSE
                 if msg.conversation_id:
@@ -300,10 +394,32 @@ class OpenAIChatAdapter:
                 if msg.finish_reason in ("stop", "error"):
                     break
 
+            # Flush remaining tool parser buffer
+            if tool_parser and not tool_calls_seen:
+                for kind, payload in tool_parser.flush():
+                    if kind == "tool":
+                        indexed_tc = _with_tool_index(payload)
+                        tool_calls_seen = True
+                        tc_chunk = {
+                            "id": chat_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"tool_calls": [indexed_tc]}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(tc_chunk)}\n\n"
+                    elif isinstance(payload, str) and payload.strip():
+                        content_len += len(payload)
+                        content_chunk = {
+                            "id": chat_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": payload}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(content_chunk)}\n\n"
+
             # After stream ends, check for async image generation.
-            # ChatGPT image gen is asynchronous: the SSE stream returns the
-            # revised prompt text and finishes, but the image appears later
-            # in the conversation. Poll for it if we have a conversation_id.
             image_url = image_url_direct
             if not image_url and has_image and asset_pointer:
                 logger.info(f"Stream [{token.email}]: resolving image asset={asset_pointer[:50]}")
@@ -324,13 +440,14 @@ class OpenAIChatAdapter:
                 }
                 yield f"data: {json.dumps(img_chunk)}\n\n"
 
-            logger.info(f"Stream [{token.email}]: finished, content_len={content_len}, has_image={bool(image_url)}")
+            finish_reason = "tool_calls" if tool_calls_seen else "stop"
+            logger.info(f"Stream [{token.email}]: finished, content_len={content_len}, has_image={bool(image_url)}, tool_calls={tool_calls_seen}")
             finish_chunk = {
                 "id": chat_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
             }
             yield f"data: {json.dumps(finish_chunk)}\n\n"
 
