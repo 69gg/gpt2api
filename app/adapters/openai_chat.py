@@ -264,6 +264,12 @@ class OpenAIChatAdapter:
                 token.record_success()
             else:
                 token.record_failure(FailReason.UNKNOWN)
+                error_chunk = {
+                    "id": chat_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": "Image generation failed"}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n"
 
             token.save()
 
@@ -279,6 +285,18 @@ class OpenAIChatAdapter:
             token.record_failure(reason)
             token.save()
             logger.error(f"ImageStream [{token.email}]: FAILED reason={reason} err={e}")
+            error_chunk = {
+                "id": chat_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"content": f"Image generation error: {error_str[:200]}"}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            finish_chunk = {
+                "id": chat_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(finish_chunk)}\n\n"
 
         yield "data: [DONE]\n\n"
 
