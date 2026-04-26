@@ -68,14 +68,22 @@ async def lifespan(app: FastAPI):
     app.state.image_adapter = image_adapter
     app.state.deployment_url = deployment_url
 
+    # Immediate refresh of expired tokens on startup
+    try:
+        startup_refreshed = await tm.refresh_expired_tokens()
+        if startup_refreshed:
+            logger.info(f"Startup refresh: {startup_refreshed} expired tokens refreshed")
+    except Exception as e:
+        logger.error(f"Startup refresh error: {e}")
+
     # Start background tasks
     tasks = []
 
-    refresh_hours = get_config("token.refresh_interval_hours", 2)
+    refresh_minutes = get_config("token.refresh_interval_minutes", 10)
     async def _refresh_loop():
         while True:
             try:
-                await asyncio.sleep(refresh_hours * 3600)
+                await asyncio.sleep(refresh_minutes * 60)
                 count = await tm.refresh_expired_tokens()
                 if count:
                     logger.info(f"Background refresh: {count} tokens refreshed")

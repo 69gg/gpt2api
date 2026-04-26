@@ -483,6 +483,6 @@ class TokenManager:
             return FailReason.BANNED
         if "quota" in body_lower or "limit exceeded" in body_lower:
             return FailReason.QUOTA_EXHAUSTED
-        if "token expired" in body_lower or "invalid token" in body_lower:
+        if "token expired" in body_lower or "invalid token" in body_lower or "token_invalidated" in body_lower:
             return FailReason.TOKEN_EXPIRED
         return FailReason.UNKNOWN
