@@ -277,18 +277,43 @@ class TokenManager:
                 return True
         return False
 
+    def _weight_for_token(self, token: TokenInfo) -> float:
+        """Higher weight for newer tokens based on registered_at."""
+        if not token.registered_at:
+            return 1.0
+        try:
+            from datetime import datetime, timezone
+            reg = datetime.fromisoformat(token.registered_at.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            age_hours = max(0, (now - reg).total_seconds() / 3600)
+            # Newer tokens get higher weight: 24h -> ~12, 0h -> 24
+            return max(1.0, 24.0 / (age_hours + 1))
+        except Exception:
+            return 1.0
+
     def get_available(self) -> Optional[TokenInfo]:
-        """Get the next available token (round-robin)."""
+        """Get the next available token (round-robin / weighted-random / least-used)."""
         available = [t for t in self._tokens if t.is_available]
         if not available:
             return None
 
+        import random
+
         load_balance = get_config("token.load_balance", "round-robin")
         if load_balance == "random":
-            import random
             return random.choice(available)
         elif load_balance == "least-used":
             return min(available, key=lambda t: t.use_count)
+        elif load_balance == "weighted-random":
+            weights = [self._weight_for_token(t) for t in available]
+            total = sum(weights)
+            r = random.uniform(0, total)
+            cum = 0.0
+            for token, w in zip(available, weights):
+                cum += w
+                if r <= cum:
+                    return token
+            return available[-1]
         else:
             # round-robin
             self._index = self._index % len(available)

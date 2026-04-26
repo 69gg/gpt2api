@@ -453,7 +453,7 @@ class ChatGPTClient:
             f"{BASE_URL}{path}", headers=headers,
             multipart=mime,
             proxies=self._proxies, impersonate=self._impersonate, timeout=60,
-            max_retries=3, delay=2.0, backoff=2.0, label="upload-file",
+            max_retries=5, delay=1.0, backoff=2.0, label="upload-file",
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"File upload failed: {resp.status_code} {resp.text[:200]}")
