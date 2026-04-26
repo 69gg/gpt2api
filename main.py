@@ -23,6 +23,18 @@ def main():
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
     args = parser.parse_args()
 
+    # Setup loguru file sink with daily rotation
+    from loguru import logger
+    logs_dir = Path(__file__).parent / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    logger.add(
+        str(logs_dir / "app.log"),
+        rotation="00:00",
+        retention="7 days",
+        encoding="utf-8",
+        level="INFO",
+    )
+
     from app.config import load_config, get_config
     load_config(args.config)
 

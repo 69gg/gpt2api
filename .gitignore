@@ -36,6 +36,7 @@ env/
 *~
 
 # Logs
+logs/
 *.log
 nohup.out
 
