@@ -130,12 +130,157 @@ class OpenAIChatAdapter:
 
         # If no URL from asset, try polling the conversation
         if not image_url and conv_id:
-            image_url = img_client._poll_for_image(conv_id, msg_id, asset_pointer, max_wait=120)
+            image_url, _ = img_client._poll_for_image(conv_id, msg_id, asset_pointer, max_wait=120)
 
         if image_url and self.deployment_url:
             image_url = _make_proxy_url(image_url, self.deployment_url)
 
         return image_url
+
+    async def _image_via_chat(self, request: Dict[str, Any],
+                              token: "TokenInfo") -> Dict[str, Any]:
+        """Handle image model via ImageClient.generate (avoids 413 from chat payload)."""
+        from app.chatgpt.image import ImageClient
+        from app.adapters.openai_image import _make_proxy_url
+
+        model = request.get("model", "auto")
+        upstream_model = _map_model(model)
+        messages = request.get("messages", [])
+
+        # Extract last user message as image prompt
+        prompt = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    prompt = content
+                elif isinstance(content, list):
+                    # multimodal: extract text parts
+                    prompt = " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+                break
+
+        if not prompt:
+            return {"error": "invalid_request", "message": "No user message found for image generation"}
+
+        prompt = f"根据以下要求生成图片：{prompt}"
+
+        client = self._create_client(token)
+        img_client = ImageClient(client)
+
+        try:
+            logger.info(f"ImageChat [{token.email}]: model={model} → upstream={upstream_model}, prompt={prompt[:60]}")
+            result = img_client.generate(prompt, model=upstream_model)
+            logger.info(f"ImageChat [{token.email}]: status={result.status}, url={bool(result.image_url)}, asset={result.asset_pointer[:50] if result.asset_pointer else '-'}")
+
+            if result.status != "success" or not result.image_url:
+                token.record_failure(FailReason.UNKNOWN)
+                token.save()
+                return {"error": "generation_failed", "message": "Image generation failed"}
+
+            image_url = result.image_url
+            if self.deployment_url:
+                image_url = _make_proxy_url(image_url, self.deployment_url)
+
+            content = f"![image]({image_url})"
+            token.record_success()
+            token.save()
+
+            return {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        except Exception as e:
+            error_str = str(e)
+            reason = self.token_manager.classify_error(0, error_str)
+            token.record_failure(reason)
+            token.save()
+            logger.error(f"ImageChat [{token.email}]: FAILED reason={reason} err={e}")
+            return {"error": "upstream_error", "message": error_str}
+
+    def _image_via_chat_stream(self, request: Dict[str, Any],
+                               token: "TokenInfo") -> Generator[str, None, None]:
+        """Handle image model streaming via ImageClient.generate."""
+        from app.chatgpt.image import ImageClient
+        from app.adapters.openai_image import _make_proxy_url
+
+        model = request.get("model", "auto")
+        upstream_model = _map_model(model)
+        messages = request.get("messages", [])
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        created = int(time.time())
+
+        # Extract last user message as image prompt
+        prompt = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    prompt = content
+                elif isinstance(content, list):
+                    prompt = " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+                break
+
+        if not prompt:
+            return
+
+        prompt = f"根据以下要求生成图片：{prompt}"
+
+        client = self._create_client(token)
+        img_client = ImageClient(client)
+
+        try:
+            # Yield role delta
+            role_chunk = {
+                "id": chat_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(role_chunk)}\n\n"
+
+            logger.info(f"ImageStream [{token.email}]: model={model} → upstream={upstream_model}, prompt={prompt[:60]}")
+            result = img_client.generate(prompt, model=upstream_model)
+            logger.info(f"ImageStream [{token.email}]: status={result.status}, url={bool(result.image_url)}")
+
+            if result.status == "success" and result.image_url:
+                image_url = result.image_url
+                if self.deployment_url:
+                    image_url = _make_proxy_url(image_url, self.deployment_url)
+
+                content_chunk = {
+                    "id": chat_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": f"![image]({image_url})"}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(content_chunk)}\n\n"
+
+                token.record_success()
+            else:
+                token.record_failure(FailReason.UNKNOWN)
+
+            token.save()
+
+            finish_chunk = {
+                "id": chat_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(finish_chunk)}\n\n"
+        except Exception as e:
+            error_str = str(e)
+            reason = self.token_manager.classify_error(0, error_str)
+            token.record_failure(reason)
+            token.save()
+            logger.error(f"ImageStream [{token.email}]: FAILED reason={reason} err={e}")
+
+        yield "data: [DONE]\n\n"
 
     def _build_messages(self, messages: List[Dict[str, Any]],
                         tools: List[Dict[str, Any]] = None,
@@ -178,8 +323,13 @@ class OpenAIChatAdapter:
         if not token:
             return {"error": "no_available_token", "message": "No available tokens in pool"}
 
-        client = self._create_client(token)
         model = request.get("model", "auto")
+
+        # Delegate image models to ImageClient to avoid 413 from multi-msg payloads
+        if _is_image_model(model) and not request.get("tools"):
+            return await self._image_via_chat(request, token)
+
+        client = self._create_client(token)
         upstream_model = _map_model(model)
         tools = request.get("tools")
         tool_choice = request.get("tool_choice")
@@ -287,8 +437,14 @@ class OpenAIChatAdapter:
             yield "data: [DONE]\n\n"
             return
 
-        client = self._create_client(token)
         model = request.get("model", "auto")
+
+        # Delegate image models to ImageClient to avoid 413
+        if _is_image_model(model) and not request.get("tools"):
+            yield from self._image_via_chat_stream(request, token)
+            return
+
+        client = self._create_client(token)
         upstream_model = _map_model(model)
         tools = request.get("tools")
         tool_choice = request.get("tool_choice")
