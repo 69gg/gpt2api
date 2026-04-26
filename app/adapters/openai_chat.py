@@ -3,6 +3,7 @@ OpenAI /v1/chat/completions adapter — converts between OpenAI format and ChatG
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -169,7 +170,7 @@ class OpenAIChatAdapter:
 
         try:
             logger.info(f"ImageChat [{token.email}]: model={model} → upstream={upstream_model}, prompt={prompt[:60]}")
-            result = img_client.generate(prompt, model=upstream_model)
+            result = await asyncio.to_thread(img_client.generate, prompt, model=upstream_model)
             logger.info(f"ImageChat [{token.email}]: status={result.status}, url={bool(result.image_url)}, asset={result.asset_pointer[:50] if result.asset_pointer else '-'}")
 
             if result.status != "success" or not result.image_url:
