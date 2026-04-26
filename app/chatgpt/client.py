@@ -430,6 +430,7 @@ class ChatGPTClient:
         """Upload a file to ChatGPT file service, return file_id.
 
         POST /backend-api/files with multipart/form-data.
+        curl_cffi uses 'multipart' param, not 'files'.
         """
         path = "/backend-api/files"
         headers = {
@@ -439,11 +440,10 @@ class ChatGPTClient:
         # Remove Content-Type so curl_cffi can set multipart boundary
         headers.pop("Content-Type", None)
 
-        files = {"file": (filename, io.BytesIO(file_bytes), mime_type)}
-
         resp = retry_call(
             curl_requests.post,
-            f"{BASE_URL}{path}", headers=headers, files=files,
+            f"{BASE_URL}{path}", headers=headers,
+            multipart={"file": (filename, file_bytes, mime_type)},
             proxies=self._proxies, impersonate=self._impersonate, timeout=60,
             max_retries=3, delay=2.0, backoff=2.0, label="upload-file",
         )
