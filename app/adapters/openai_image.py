@@ -116,13 +116,17 @@ class OpenAIImageAdapter:
             images = []
             proxied_url = _make_proxy_url(result.image_url, self.deployment_url)
             logger.info(f"Edit [{token.email}]: url={proxied_url[:80]}...")
-            image_data = {
-                "url": proxied_url,
-                "revised_prompt": result.revised_prompt or prompt,
-            }
+
             if response_format == "b64_json":
                 image_data = self._download_b64(
-                    client, result, token, prompt, image_data)
+                    client, result, token, prompt)
+                if not image_data:
+                    return {"error": "download_failed", "message": "Failed to download image for b64_json encoding"}
+            else:
+                image_data = {
+                    "url": proxied_url,
+                    "revised_prompt": result.revised_prompt or prompt,
+                }
 
             images.append(image_data)
 
@@ -178,13 +182,17 @@ class OpenAIImageAdapter:
             images = []
             proxied_url = _make_proxy_url(result.image_url, self.deployment_url)
             logger.info(f"Image [{token.email}]: url={proxied_url[:80]}...")
-            image_data = {
-                "url": proxied_url,
-                "revised_prompt": result.revised_prompt or prompt,
-            }
+
             if response_format == "b64_json":
                 image_data = self._download_b64(
-                    client, result, token, prompt, image_data)
+                    client, result, token, prompt)
+                if not image_data:
+                    return {"error": "download_failed", "message": "Failed to download image for b64_json encoding"}
+            else:
+                image_data = {
+                    "url": proxied_url,
+                    "revised_prompt": result.revised_prompt or prompt,
+                }
 
             images.append(image_data)
 
@@ -201,9 +209,8 @@ class OpenAIImageAdapter:
             return {"error": "upstream_error", "message": error_str}
 
     def _download_b64(self, client: "ImageClient", result: "ImageResult",
-                      token: TokenInfo, prompt: str,
-                      image_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Download image as base64, refreshing signed URL on 403."""
+                      token: TokenInfo, prompt: str) -> Optional[Dict[str, Any]]:
+        """Download image as base64. Returns dict with b64_json or None on failure."""
         from curl_cffi import requests as curl_requests
 
         effective_proxy = token.get_proxy(self.proxy)
@@ -259,4 +266,4 @@ class OpenAIImageAdapter:
         except Exception as e:
             logger.warning(f"b64 download error: {e}")
 
-        return image_data  # fallback to url response
+        return None
