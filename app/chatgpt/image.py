@@ -40,7 +40,8 @@ class ImageClient:
         self._last_conv_id = ""
 
     def generate(self, prompt: str, model: str = "gpt-5-3",
-                 conversation_id: str = "") -> ImageResult:
+                 conversation_id: str = "", attachments: Optional[List[str]] = None,
+                 system_hints: Optional[List[str]] = None) -> ImageResult:
         """Generate an image using f/conversation with picture_v2 system hint.
 
         Flow:
@@ -49,6 +50,10 @@ class ImageClient:
         3. f/conversation with system_hints=["picture_v2"]
         4. Extract asset_pointer from SSE
         5. Poll conversation for image URL
+
+        Args:
+            attachments: List of file_ids to attach (for image editing).
+            system_hints: Override system hints (default ["picture_v2"]).
         """
         # 1. Bootstrap + chat-requirements
         self.client.sentinel.bootstrap()
@@ -64,12 +69,14 @@ class ImageClient:
                 self.client.sentinel.pow_max_iter,
             )
 
-        # 2. Prepare with picture_v2
+        # 2. Prepare with picture_v2 (or custom hints)
+        hints = system_hints if system_hints is not None else ["picture_v2"]
         opts = ChatOptions(
             messages=[{"role": "user", "content": prompt}],
             model=model,
             conversation_id=conversation_id,
-            system_hints=["picture_v2"],
+            system_hints=hints,
+            attachments=attachments or [],
         )
         conduit_token = self.client.prepare_fchat(chat_token, proof_token, opts)
 

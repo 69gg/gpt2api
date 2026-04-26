@@ -58,6 +58,131 @@ class OpenAIImageAdapter:
         )
         return ImageClient(chat_client)
 
+    async def edit(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle image editing request.
+
+        Accepts OpenAI /v1/images/edits format:
+        - image: base64 string or URL
+        - mask: base64 string or URL (optional)
+        - prompt: editing instructions
+        - model, size, n, response_format
+
+        Flow:
+        1. Download image (and mask) from URL if needed
+        2. Upload image(s) to ChatGPT file service
+        3. Send multimodal message with attachments + prompt
+        4. Extract and return generated image
+        """
+        token = self.token_manager.get_available()
+        if not token:
+            return {"error": "no_available_token", "message": "No available tokens in pool"}
+
+        prompt = request.get("prompt", "")
+        if not prompt:
+            return {"error": "invalid_request", "message": "Prompt cannot be empty"}
+
+        image_input = request.get("image", "")
+        mask_input = request.get("mask", "")
+        model = request.get("model", "gpt-image-2")
+        response_format = request.get("response_format", "url")
+
+        if not image_input:
+            return {"error": "invalid_request", "message": "Image is required for editing"}
+
+        client = self._create_client(token)
+        chat_client = client.client  # underlying ChatGPTClient
+
+        try:
+            # 1. Download image bytes (from URL or decode base64)
+            def _get_bytes(data: str) -> bytes:
+                if data.startswith("http://") or data.startswith("https://"):
+                    effective_proxy = token.get_proxy(self.proxy)
+                    proxies = {"http": effective_proxy, "https": effective_proxy} if effective_proxy else None
+                    resp = curl_requests.get(
+                        data, timeout=30, proxies=proxies,
+                        impersonate=token.impersonate or "chrome136",
+                        headers={"Referer": "https://chatgpt.com/"},
+                    )
+                    if resp.status_code != 200:
+                        raise RuntimeError(f"Download image failed: {resp.status_code}")
+                    return resp.content
+                # Base64 decode
+                if data.startswith("data:"):
+                    data = data.split(",")[-1]
+                return base64.b64decode(data)
+
+            image_bytes = _get_bytes(image_input)
+
+            # 2. Upload image to ChatGPT file service
+            image_file_id = chat_client.upload_file(
+                image_bytes, filename="image.png", mime_type="image/png")
+            logger.info(f"Edit [{token.email}]: uploaded image file_id={image_file_id}")
+
+            attachments = [image_file_id]
+
+            # 3. Handle mask (upload as second image if provided)
+            if mask_input:
+                mask_bytes = _get_bytes(mask_input)
+                mask_file_id = chat_client.upload_file(
+                    mask_bytes, filename="mask.png", mime_type="image/png")
+                logger.info(f"Edit [{token.email}]: uploaded mask file_id={mask_file_id}")
+                attachments.append(mask_file_id)
+                # Instruct ChatGPT to only edit the masked area
+                prompt += " (only edit the white/transparent area shown in the second image)"
+
+            # 4. Generate with attachments
+            logger.info(f"Edit [{token.email}]: prompt={prompt[:60]}... attachments={len(attachments)}")
+            result = client.generate(
+                prompt, model="gpt-5-3", attachments=attachments)
+            logger.info(f"Edit [{token.email}]: status={result.status}, url={bool(result.image_url)}")
+
+            if result.status != "success" or not result.image_url:
+                token.record_failure(FailReason.UNKNOWN)
+                token.save()
+                logger.warning(f"Edit [{token.email}]: generation failed, status={result.status}")
+                return {"error": "generation_failed", "message": "Image editing failed"}
+
+            token.record_success()
+            token.save()
+
+            images = []
+            proxied_url = _make_proxy_url(result.image_url, self.deployment_url)
+            logger.info(f"Edit [{token.email}]: url={proxied_url[:80]}...")
+            image_data = {
+                "url": proxied_url,
+                "revised_prompt": result.revised_prompt or prompt,
+            }
+            if response_format == "b64_json":
+                try:
+                    effective_proxy = token.get_proxy(self.proxy)
+                    proxies = {"http": effective_proxy, "https": effective_proxy} if effective_proxy else None
+                    resp = curl_requests.get(
+                        result.image_url, timeout=30, proxies=proxies,
+                        impersonate=token.impersonate or "chrome136",
+                        headers={"Referer": "https://chatgpt.com/"},
+                    )
+                    if resp.status_code == 200:
+                        image_data = {
+                            "b64_json": base64.b64encode(resp.content).decode("ascii"),
+                            "revised_prompt": result.revised_prompt or prompt,
+                        }
+                except Exception:
+                    pass
+
+            images.append(image_data)
+
+            return {
+                "created": int(time.time()),
+                "data": images,
+            }
+        except Exception as e:
+            error_str = str(e)
+            reason = self.token_manager.classify_error(0, error_str)
+            token.record_failure(reason)
+            token.save()
+            logger.error(f"Edit [{token.email}]: FAILED reason={reason} err={e}")
+            return {"error": "upstream_error", "message": error_str}
+
     async def generate(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Handle image generation request."""
         token = self.token_manager.get_available()

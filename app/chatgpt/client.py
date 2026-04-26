@@ -10,6 +10,7 @@ Handles:
 """
 from __future__ import annotations
 
+import io
 import json
 import time
 import uuid
@@ -35,12 +36,13 @@ DEFAULT_USER_AGENT = (
 @dataclass
 class ChatOptions:
     """Options for a single chat request."""
-    messages: List[Dict[str, str]] = field(default_factory=list)
+    messages: List[Dict[str, Any]] = field(default_factory=list)
     model: str = "auto"
     conversation_id: str = ""
     parent_message_id: str = ""
     system_hints: List[str] = field(default_factory=list)
     sse_timeout: int = 120
+    attachments: List[str] = field(default_factory=list)  # file_ids to attach
 
 
 @dataclass
@@ -127,6 +129,18 @@ class ChatGPTClient:
                 user_content = m.get("content", "")
                 break
 
+        # Build partial_query content (multimodal if attachments present)
+        if opts.attachments:
+            parts = [{"type": "text", "text": user_content}]
+            for file_id in opts.attachments:
+                parts.append({
+                    "type": "image",
+                    "asset_pointer": f"file-service://{file_id}",
+                })
+            partial_content = {"content_type": "multimodal_text", "parts": parts}
+        else:
+            partial_content = {"content_type": "text", "parts": [user_content]}
+
         payload = {
             "action": "next",
             "parent_message_id": parent_msg_id,
@@ -139,7 +153,7 @@ class ChatGPTClient:
             "partial_query": {
                 "id": str(uuid.uuid4()),
                 "author": {"role": "user"},
-                "content": {"content_type": "text", "parts": [user_content]},
+                "content": partial_content,
             },
             "supports_buffering": True,
             "supported_encodings": ["v1"],
@@ -181,13 +195,38 @@ class ChatGPTClient:
         parent_msg_id = opts.parent_message_id or str(uuid.uuid4())
 
         # Build messages payload (align with HAR capture for text pathway)
+        # If attachments are present, the last user message becomes multimodal.
         msgs = []
-        for m in opts.messages:
+        attachment_idx = 0
+        for i, m in enumerate(opts.messages):
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            is_last_user = (i == len(opts.messages) - 1) and role == "user"
+            has_attachments = is_last_user and opts.attachments
+
+            if has_attachments:
+                # Multimodal message with text + image attachments
+                parts = [{"type": "text", "text": content}]
+                for file_id in opts.attachments:
+                    parts.append({
+                        "type": "image",
+                        "asset_pointer": f"file-service://{file_id}",
+                    })
+                msg_content = {
+                    "content_type": "multimodal_text",
+                    "parts": parts,
+                }
+            else:
+                msg_content = {
+                    "content_type": "text",
+                    "parts": [content],
+                }
+
             msgs.append({
                 "id": str(uuid.uuid4()),
-                "author": {"role": m["role"]},
+                "author": {"role": role},
                 "create_time": time.time(),
-                "content": {"content_type": "text", "parts": [m["content"]]},
+                "content": msg_content,
                 "metadata": {
                     "developer_mode_connector_ids": [],
                     "selected_sources": [],
@@ -383,3 +422,39 @@ class ChatGPTClient:
             raise RuntimeError(f"/conversation failed: {resp.status_code} {resp.text[:200]}")
 
         yield from extract_chat_messages(parse_sse_stream(resp))
+
+    # ---------- File upload ----------
+
+    def upload_file(self, file_bytes: bytes, filename: str = "image.png",
+                    mime_type: str = "image/png") -> str:
+        """Upload a file to ChatGPT file service, return file_id.
+
+        POST /backend-api/files with multipart/form-data.
+        """
+        path = "/backend-api/files"
+        headers = {
+            **self._common_headers(path),
+            "Accept": "*/*",
+        }
+        # Remove Content-Type so curl_cffi can set multipart boundary
+        headers.pop("Content-Type", None)
+
+        files = {"file": (filename, io.BytesIO(file_bytes), mime_type)}
+
+        resp = retry_call(
+            curl_requests.post,
+            f"{BASE_URL}{path}", headers=headers, files=files,
+            proxies=self._proxies, impersonate=self._impersonate, timeout=60,
+            max_retries=3, delay=2.0, backoff=2.0, label="upload-file",
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"File upload failed: {resp.status_code} {resp.text[:200]}")
+
+        data = resp.json()
+        file_id = data.get("file_id", "")
+        if not file_id:
+            file_id = data.get("id", "")
+        if not file_id:
+            raise RuntimeError(f"File upload returned no file_id: {data}")
+        logger.debug(f"Upload OK: file_id={file_id}")
+        return file_id

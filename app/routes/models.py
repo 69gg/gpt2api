@@ -28,3 +28,13 @@ async def create_image(request: Request):
     if "error" in result:
         return JSONResponse(status_code=502, content=result)
     return JSONResponse(content=result)
+
+
+@router.post("/v1/images/edits")
+async def edit_image(request: Request):
+    body = await request.json()
+    adapter: OpenAIImageAdapter = request.app.state.image_adapter
+    result = await adapter.edit(body)
+    if "error" in result:
+        return JSONResponse(status_code=502, content=result)
+    return JSONResponse(content=result)
