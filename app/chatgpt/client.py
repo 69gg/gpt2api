@@ -33,6 +33,33 @@ DEFAULT_USER_AGENT = (
 )
 
 
+def _image_dimensions(data: bytes) -> Tuple[int, int]:
+    """Extract width, height from PNG or JPEG bytes. Returns (0, 0) if unknown."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) > 24:
+        import struct
+        w, h = struct.unpack(">II", data[16:24])
+        return w, h
+    if data[:2] == b"\xff\xd8" and len(data) > 5:
+        import struct
+        off = 2
+        while off < len(data) - 1:
+            if data[off] != 0xFF:
+                break
+            marker = data[off + 1]
+            if marker in (0xC0, 0xC1, 0xC2):
+                if off + 9 <= len(data):
+                    h, w = struct.unpack(">HH", data[off + 5:off + 9])
+                    return w, h
+            if marker in (0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9):
+                off += 2
+            else:
+                if off + 4 > len(data):
+                    break
+                seg_len = struct.unpack(">H", data[off + 2:off + 4])[0]
+                off += 2 + seg_len
+    return 0, 0
+
+
 @dataclass
 class ChatOptions:
     """Options for a single chat request."""
@@ -42,7 +69,7 @@ class ChatOptions:
     parent_message_id: str = ""
     system_hints: List[str] = field(default_factory=list)
     sse_timeout: int = 120
-    attachments: List[str] = field(default_factory=list)  # file_ids to attach
+    attachments: List[Any] = field(default_factory=list)  # file_ids or dicts {file_id, size_bytes, width, height}
 
 
 @dataclass
@@ -132,11 +159,24 @@ class ChatGPTClient:
         # Build partial_query content (multimodal if attachments present)
         if opts.attachments:
             parts = [{"type": "text", "text": user_content}]
-            for file_id in opts.attachments:
-                parts.append({
-                    "type": "image",
-                    "asset_pointer": f"file-service://{file_id}",
-                })
+            for att in opts.attachments:
+                if isinstance(att, dict):
+                    fid = att.get("file_id", att.get("id", ""))
+                    parts.append({
+                        "content_type": "image_asset_pointer",
+                        "asset_pointer": f"file-service://{fid}",
+                        "size_bytes": att.get("size_bytes", 0),
+                        "width": att.get("width", 0),
+                        "height": att.get("height", 0),
+                    })
+                else:
+                    parts.append({
+                        "content_type": "image_asset_pointer",
+                        "asset_pointer": f"file-service://{att}",
+                        "size_bytes": 0,
+                        "width": 0,
+                        "height": 0,
+                    })
             partial_content = {"content_type": "multimodal_text", "parts": parts}
         else:
             partial_content = {"content_type": "text", "parts": [user_content]}
@@ -207,11 +247,24 @@ class ChatGPTClient:
             if has_attachments:
                 # Multimodal message with text + image attachments
                 parts = [{"type": "text", "text": content}]
-                for file_id in opts.attachments:
-                    parts.append({
-                        "type": "image",
-                        "asset_pointer": f"file-service://{file_id}",
-                    })
+                for att in opts.attachments:
+                    if isinstance(att, dict):
+                        fid = att.get("file_id", att.get("id", ""))
+                        parts.append({
+                            "content_type": "image_asset_pointer",
+                            "asset_pointer": f"file-service://{fid}",
+                            "size_bytes": att.get("size_bytes", 0),
+                            "width": att.get("width", 0),
+                            "height": att.get("height", 0),
+                        })
+                    else:
+                        parts.append({
+                            "content_type": "image_asset_pointer",
+                            "asset_pointer": f"file-service://{att}",
+                            "size_bytes": 0,
+                            "width": 0,
+                            "height": 0,
+                        })
                 msg_content = {
                     "content_type": "multimodal_text",
                     "parts": parts,
@@ -426,43 +479,91 @@ class ChatGPTClient:
     # ---------- File upload ----------
 
     def upload_file(self, file_bytes: bytes, filename: str = "image.png",
-                    mime_type: str = "image/png") -> str:
-        """Upload a file to ChatGPT file service, return file_id.
+                    mime_type: str = "image/png") -> Dict[str, Any]:
+        """Upload a file to ChatGPT file service, return file metadata dict.
 
-        POST /backend-api/files with multipart/form-data.
-        curl_cffi uses 'multipart' param, not 'files'.
+        Three-step protocol:
+        1. POST /backend-api/files JSON body → get presigned upload_url + file_id
+        2. PUT upload_url with file bytes + x-ms-blob-type: BlockBlob → Azure Blob Storage
+        3. POST /backend-api/files/{file_id}/uploaded → confirm upload, file becomes "ready"
+
+        Returns dict with file_id, size_bytes, width, height for use as attachment.
         """
         path = "/backend-api/files"
-        headers = {
-            **self._common_headers(path),
-            "Accept": "*/*",
-        }
-        # Remove Content-Type so curl_cffi can set multipart boundary
-        headers.pop("Content-Type", None)
 
-        from curl_cffi.curl import CurlMime
-        mime = CurlMime.from_list([{
-            "name": "file",
-            "content_type": mime_type,
-            "filename": filename,
-            "data": file_bytes,
-        }])
-
+        # Step 1: Request presigned upload URL
         resp = retry_call(
             curl_requests.post,
-            f"{BASE_URL}{path}", headers=headers,
-            multipart=mime,
-            proxies=self._proxies, impersonate=self._impersonate, timeout=60,
-            max_retries=5, delay=1.0, backoff=2.0, label="upload-file",
+            f"{BASE_URL}{path}",
+            headers={
+                **self._common_headers(path),
+                "Accept": "*/*",
+                "Content-Type": "application/json",
+            },
+            json={"file_name": filename, "use_case": "multimodal"},
+            proxies=self._proxies, impersonate=self._impersonate, timeout=30,
+            max_retries=3, delay=1.0, backoff=2.0, label="upload-file-init",
         )
         if resp.status_code >= 400:
-            raise RuntimeError(f"File upload failed: {resp.status_code} {resp.text[:200]}")
+            raise RuntimeError(f"File upload init failed: {resp.status_code} {resp.text[:200]}")
 
         data = resp.json()
+        upload_url = data.get("upload_url", "")
         file_id = data.get("file_id", "")
         if not file_id:
             file_id = data.get("id", "")
-        if not file_id:
-            raise RuntimeError(f"File upload returned no file_id: {data}")
+        if not file_id or not upload_url:
+            raise RuntimeError(f"File upload init returned no file_id/upload_url: {data}")
+
+        # Step 2: Upload file bytes to Azure Blob Storage presigned URL
+        put_resp = retry_call(
+            curl_requests.put,
+            upload_url,
+            headers={
+                "Content-Type": mime_type,
+                "x-ms-blob-type": "BlockBlob",
+                "Content-Length": str(len(file_bytes)),
+            },
+            data=file_bytes,
+            impersonate="chrome131",
+            timeout=60,
+            max_retries=3, delay=1.0, backoff=2.0, label="upload-file-put",
+        )
+        if put_resp.status_code >= 400:
+            raise RuntimeError(f"File upload PUT failed: {put_resp.status_code} {put_resp.text[:200]}")
+
+        # Step 3: Confirm upload completion
+        confirm_path = f"{path}/{file_id}/uploaded"
+        confirm_resp = retry_call(
+            curl_requests.post,
+            f"{BASE_URL}{confirm_path}",
+            headers={
+                **self._common_headers(confirm_path),
+                "Accept": "*/*",
+                "Content-Type": "application/json",
+            },
+            json={},
+            proxies=self._proxies, impersonate=self._impersonate, timeout=30,
+            max_retries=2, delay=1.0, backoff=2.0, label="upload-file-confirm",
+        )
+        if confirm_resp.status_code >= 400:
+            raise RuntimeError(f"File upload confirm failed: {confirm_resp.status_code} {confirm_resp.text[:200]}")
+
+        # Extract metadata from confirm response
+        confirm_data = confirm_resp.json() if confirm_resp.status_code == 200 else {}
+
+        # Auto-detect image dimensions for image uploads
+        width = confirm_data.get("width", 0)
+        height = confirm_data.get("height", 0)
+        if not width or not height:
+            width, height = _image_dimensions(file_bytes)
+
+        result = {
+            "file_id": file_id,
+            "size_bytes": len(file_bytes),
+            "width": width or 0,
+            "height": height or 0,
+        }
+
         logger.debug(f"Upload OK: file_id={file_id}")
-        return file_id
+        return result

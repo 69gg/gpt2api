@@ -83,18 +83,18 @@ class OpenAIImageAdapter:
 
         try:
             # 1. Upload image to ChatGPT file service
-            image_file_id = chat_client.upload_file(
+            image_meta = chat_client.upload_file(
                 image_bytes, filename="image.png", mime_type="image/png")
-            logger.info(f"Edit [{token.email}]: uploaded image file_id={image_file_id}")
+            logger.info(f"Edit [{token.email}]: uploaded image file_id={image_meta.get('file_id', image_meta)}")
 
-            attachments = [image_file_id]
+            attachments = [image_meta]
 
             # 2. Handle mask (upload as second image if provided)
             if mask_bytes:
-                mask_file_id = chat_client.upload_file(
+                mask_meta = chat_client.upload_file(
                     mask_bytes, filename="mask.png", mime_type="image/png")
-                logger.info(f"Edit [{token.email}]: uploaded mask file_id={mask_file_id}")
-                attachments.append(mask_file_id)
+                logger.info(f"Edit [{token.email}]: uploaded mask file_id={mask_meta.get('file_id', mask_meta)}")
+                attachments.append(mask_meta)
                 # Instruct ChatGPT to only edit the masked area
                 prompt += " (only edit the white/transparent area shown in the second image)"
 

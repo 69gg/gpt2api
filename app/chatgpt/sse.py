@@ -222,6 +222,14 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
         if key not in accumulators:
             accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conversation_id}
 
+        # Detect replay: a full message update with status="finished_successfully"
+        # and no prior delta content means this is a historical message being
+        # replayed (e.g. previous assistant messages in multi-turn payload).
+        # We must not yield its text content to avoid duplicating it.
+        had_prior_delta = bool(accumulators[key]["text"])
+        msg_status = msg.get("status", "")
+        is_replay = not had_prior_delta and msg_status == "finished_successfully"
+
         # Check for image
         is_image = False
         image_url = ""
@@ -256,19 +264,30 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
         if not finish and msg.get("finish_details"):
             finish = msg["finish_details"].get("type", "")
 
-        # Only emit if there's actual content or a finish signal
-        if accumulators[key]["text"] or is_image or finish:
-            yield ChatMessage(
-                message_id=message_id,
-                conversation_id=conversation_id,
-                role=role,
-                content=accumulators[key]["text"],
-                model=model,
-                finish_reason=finish,
-                is_image=is_image,
-                image_url=image_url,
-                asset_pointer=asset_pointer,
-            )
+        if is_replay:
+            # Replayed historical message: only yield metadata, not content
+            if conversation_id or message_id:
+                yield ChatMessage(
+                    message_id=message_id,
+                    conversation_id=conversation_id,
+                    role=role,
+                    content="",
+                )
+        else:
+            # For new messages: don't re-yield text if already emitted via deltas
+            emit_content = "" if had_prior_delta else accumulators[key]["text"]
+            if emit_content or is_image or finish:
+                yield ChatMessage(
+                    message_id=message_id,
+                    conversation_id=conversation_id,
+                    role=role,
+                    content=emit_content,
+                    model=model,
+                    finish_reason=finish,
+                    is_image=is_image,
+                    image_url=image_url,
+                    asset_pointer=asset_pointer,
+                )
 
 
 def stream_text_from_response(response) -> Generator[str, None, None]:
