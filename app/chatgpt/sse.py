@@ -125,9 +125,64 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
 
         # --- JSON Patch incremental delta ---
         # e.g. {"p": "/message/content/parts/0", "o": "append", "v": "Hello"}
-        # But {"p": "", "o": "add", "v": {"message": ...}} is a full message update, skip to that branch
-        if "p" in data and "o" in data and "v" in data and not (data.get("p") == "" and isinstance(data.get("v"), dict)):
+        # Also handles {"p": "", "o": "add", "v": {"message": ...}} from delta_encoding
+        if "p" in data and "o" in data and "v" in data:
+            patch_path = data.get("p", "")
+            patch_op = data.get("o", "")
             patch_value = data["v"]
+
+            # Full message add via delta_encoding: {"p": "", "o": "add", "v": {"message": ...}}
+            if patch_path == "" and patch_op == "add" and isinstance(patch_value, dict):
+                msg = patch_value.get("message", {})
+                if msg:
+                    conv_id = patch_value.get("conversation_id", "")
+                    message_id = msg.get("id", "")
+                    role = (msg.get("author") or {}).get("role", "")
+                    if role not in ("assistant", ""):
+                        continue
+                    content_parts = (msg.get("content") or {}).get("parts", [])
+                    model = msg.get("model", "")
+                    key = f"{conv_id}:{message_id}"
+                    if key not in accumulators:
+                        accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conv_id}
+
+                    # Build text content
+                    text_parts = []
+                    is_image = False
+                    asset_pointer = ""
+                    for part in content_parts:
+                        if isinstance(part, str):
+                            text_parts.append(part)
+                        elif isinstance(part, dict):
+                            if part.get("asset_pointer"):
+                                asset_pointer = part["asset_pointer"]
+                                is_image = True
+                    content = "".join(text_parts)
+                    if content:
+                        accumulators[key]["text"] = content
+
+                    # Finish reason
+                    finish = ""
+                    finish_details = (msg.get("metadata") or {}).get("finish_details", {})
+                    if finish_details:
+                        finish = finish_details.get("type", "")
+                    if msg.get("status") == "finished_successfully" and not finish:
+                        finish = "stop"
+
+                    if content or is_image or finish:
+                        yield ChatMessage(
+                            message_id=message_id,
+                            conversation_id=conv_id,
+                            role=role,
+                            content=content,
+                            model=model,
+                            finish_reason=finish,
+                            is_image=is_image,
+                            asset_pointer=asset_pointer,
+                        )
+                continue
+
+            # Incremental text delta
             conv_id = data.get("conversation_id", "")
             msg_id = data.get("message_id", "")
             key = f"{conv_id}:{msg_id}"
