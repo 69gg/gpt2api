@@ -440,10 +440,18 @@ class ChatGPTClient:
         # Remove Content-Type so curl_cffi can set multipart boundary
         headers.pop("Content-Type", None)
 
+        from curl_cffi.curl import CurlMime
+        mime = CurlMime.from_list([{
+            "name": "file",
+            "content_type": mime_type,
+            "filename": filename,
+            "data": file_bytes,
+        }])
+
         resp = retry_call(
             curl_requests.post,
             f"{BASE_URL}{path}", headers=headers,
-            multipart={"file": (filename, file_bytes, mime_type)},
+            multipart=mime,
             proxies=self._proxies, impersonate=self._impersonate, timeout=60,
             max_retries=3, delay=2.0, backoff=2.0, label="upload-file",
         )
