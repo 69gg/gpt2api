@@ -7,6 +7,7 @@ OpenAI/Anthropic 兼容 API，后端接入 ChatGPT Web Chat (`chatgpt.com`)。
 - `/v1/responses` (OpenAI Responses)
 - `/v1/messages` (Anthropic Messages)
 - `/v1/images/generations` (图片生成，支持图片代理)
+- `/v1/images/edits` (图片编辑，支持上传图片 + 可选 mask)
 - `/v1/models`
 - `/admin/*` Token 池管理
 - 单 token 代理配置（`http`/`socks5`/`socks5h`）
@@ -65,7 +66,7 @@ register:
   min_tokens: 3                    # 最少保持的 token 数
 
 token:
-  refresh_interval_hours: 2        # 自动刷新过期 token
+  refresh_interval_minutes: 10      # 自动刷新过期 token 间隔（分钟）
   dead_retain_hours: 24            # 死 token 保留时间
   cooling_reset_hours: 24          # 冷却重置时间
   fail_threshold: 5                # 失败多少次标记为 dead
@@ -97,7 +98,7 @@ models:                             # 可用模型列表（对应 chatgpt.com �
 ```bash
 export GPT2API_SERVER_API_KEY=sk-xxxx
 export GPT2API_CHATGPT_PROXY=http://127.0.0.1:7890
-export GPT2API_TOKEN_REFRESH_INTERVAL_HOURS=1
+export GPT2API_TOKEN_REFRESH_INTERVAL_MINUTES=10
 ```
 
 ### 3. 启动服务
@@ -305,7 +306,7 @@ gpt2api/
 
 服务启动后自动启动 5 个后台任务：
 
-1. **Token 刷新**（默认每 2 小时）：用 `refresh_token` 换取新的 `access_token`
+1. **Token 刷新**（默认每 10 分钟）：用 `refresh_token` 换取新的 `access_token`
 2. **冷却恢复**（每 10 分钟）：配额耗尽的 token 等待冷却期后恢复 active
 3. **新 Token 扫描**（每 30 秒）：检测 `web_token/` 目录新增的文件
 4. **死 Token 清理**（每小时）：删除超过保留期的 dead token
