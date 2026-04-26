@@ -121,24 +121,8 @@ class OpenAIImageAdapter:
                 "revised_prompt": result.revised_prompt or prompt,
             }
             if response_format == "b64_json":
-                try:
-                    from curl_cffi import requests as curl_requests
-                    effective_proxy = token.get_proxy(self.proxy)
-                    proxies = {"http": effective_proxy, "https": effective_proxy} if effective_proxy else None
-                    resp = curl_requests.get(
-                        result.image_url, timeout=30, proxies=proxies,
-                        impersonate=token.impersonate or "chrome136",
-                        headers={"Referer": "https://chatgpt.com/"},
-                    )
-                    if resp.status_code == 200:
-                        image_data = {
-                            "b64_json": base64.b64encode(resp.content).decode("ascii"),
-                            "revised_prompt": result.revised_prompt or prompt,
-                        }
-                    else:
-                        logger.warning(f"Edit [{token.email}]: b64 download failed: HTTP {resp.status_code}")
-                except Exception as e:
-                    logger.warning(f"Edit [{token.email}]: b64 download error: {e}")
+                image_data = self._download_b64(
+                    client, result, token, prompt, image_data)
 
             images.append(image_data)
 
@@ -199,24 +183,8 @@ class OpenAIImageAdapter:
                 "revised_prompt": result.revised_prompt or prompt,
             }
             if response_format == "b64_json":
-                try:
-                    from curl_cffi import requests as curl_requests
-                    effective_proxy = token.get_proxy(self.proxy)
-                    proxies = {"http": effective_proxy, "https": effective_proxy} if effective_proxy else None
-                    resp = curl_requests.get(
-                        result.image_url, timeout=30, proxies=proxies,
-                        impersonate=token.impersonate or "chrome136",
-                        headers={"Referer": "https://chatgpt.com/"},
-                    )
-                    if resp.status_code == 200:
-                        image_data = {
-                            "b64_json": base64.b64encode(resp.content).decode("ascii"),
-                            "revised_prompt": result.revised_prompt or prompt,
-                        }
-                    else:
-                        logger.warning(f"Image [{token.email}]: b64 download failed: HTTP {resp.status_code}")
-                except Exception as e:
-                    logger.warning(f"Image [{token.email}]: b64 download error: {e}")
+                image_data = self._download_b64(
+                    client, result, token, prompt, image_data)
 
             images.append(image_data)
 
@@ -231,3 +199,58 @@ class OpenAIImageAdapter:
             token.save()
             logger.error(f"Image [{token.email}]: FAILED reason={reason} err={e}")
             return {"error": "upstream_error", "message": error_str}
+
+    def _download_b64(self, client: "ImageClient", result: "ImageResult",
+                      token: TokenInfo, prompt: str,
+                      image_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Download image as base64, refreshing signed URL on 403."""
+        from curl_cffi import requests as curl_requests
+
+        effective_proxy = token.get_proxy(self.proxy)
+        proxies = {"http": effective_proxy, "https": effective_proxy} if effective_proxy else None
+        impersonate = token.impersonate or "chrome136"
+        headers = {
+            "Referer": "https://chatgpt.com/",
+            "User-Agent": token.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+
+        download_url = result.image_url
+
+        # If asset_pointer available, get a fresh signed URL
+        if result.asset_pointer:
+            fresh_url = client._download_asset(result.asset_pointer)
+            if fresh_url:
+                download_url = fresh_url
+                logger.debug(f"b64: refreshed signed URL via asset_pointer")
+
+        try:
+            resp = curl_requests.get(
+                download_url, timeout=30, proxies=proxies,
+                impersonate=impersonate, headers=headers,
+            )
+            if resp.status_code == 200:
+                return {
+                    "b64_json": base64.b64encode(resp.content).decode("ascii"),
+                    "revised_prompt": result.revised_prompt or prompt,
+                }
+
+            # If still failing, try once more with a fresh URL
+            if resp.status_code == 403 and result.asset_pointer:
+                logger.warning(f"b64 download 403, retrying with fresh signed URL")
+                fresh_url = client._download_asset(result.asset_pointer)
+                if fresh_url and fresh_url != download_url:
+                    resp = curl_requests.get(
+                        fresh_url, timeout=30, proxies=proxies,
+                        impersonate=impersonate, headers=headers,
+                    )
+                    if resp.status_code == 200:
+                        return {
+                            "b64_json": base64.b64encode(resp.content).decode("ascii"),
+                            "revised_prompt": result.revised_prompt or prompt,
+                        }
+
+            logger.warning(f"b64 download failed: HTTP {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"b64 download error: {e}")
+
+        return image_data  # fallback to url response
