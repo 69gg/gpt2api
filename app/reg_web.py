@@ -234,8 +234,21 @@ class CFEmailProvider:
         self.cf_url = cf_url.rstrip("/")
         self.cf_auth = cf_auth
         self.cf_admin_auth = cf_admin_auth
-        self.cf_domain = cf_domain
+        # Support comma-separated domains with round-robin
+        self._domains = [d.strip() for d in cf_domain.split(",") if d.strip()]
+        self._domain_idx = 0
         self.proxies = proxies
+
+    @property
+    def cf_domain(self) -> str:
+        if not self._domains:
+            return ""
+        return self._domains[self._domain_idx % len(self._domains)]
+
+    def _next_domain(self) -> None:
+        """Advance to next domain for round-robin."""
+        if self._domains:
+            self._domain_idx += 1
 
     def _headers(self, *, address_jwt: str = "") -> Dict[str, str]:
         h = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -255,8 +268,9 @@ class CFEmailProvider:
         data: Dict[str, Any] = {"name": local}
         if use_admin_api:
             data["enablePrefix"] = False
-        if self.cf_domain:
-            data["domain"] = self.cf_domain
+        current_domain = self.cf_domain
+        if current_domain:
+            data["domain"] = current_domain
 
         for attempt in range(1, 6):
             try:
@@ -273,13 +287,20 @@ class CFEmailProvider:
                 email = str(result.get("address") or result.get("email") or "").strip()
                 jwt_token = str(result.get("jwt") or result.get("token") or "").strip()
                 if email and jwt_token:
+                    self._next_domain()  # rotate to next domain
                     return email, jwt_token
                 raise RuntimeError(f"create_email returned incomplete data: {result}")
 
             body = resp.text.strip().lower()
-            if resp.status_code == 400 and self.cf_domain and "invalid domain" in body:
+            if resp.status_code == 400 and current_domain and "invalid domain" in body:
+                # Remove only the invalid domain, try next
+                if current_domain in self._domains:
+                    self._domains.remove(current_domain)
+                    logger.warning(f"Removed invalid domain: {current_domain}, remaining: {self._domains}")
+                current_domain = self.cf_domain  # get next domain
                 data.pop("domain", None)
-                self.cf_domain = ""
+                if current_domain:
+                    data["domain"] = current_domain
                 time.sleep(1)
                 continue
             if resp.status_code == 400 and ("already exists" in body or "unique" in body):
