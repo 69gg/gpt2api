@@ -194,6 +194,10 @@ class TokenInfo:
         elif reason == FailReason.TOKEN_EXPIRED:
             self.status = TokenStatus.EXPIRED
             logger.info(f"Token {self.email} marked EXPIRED")
+            # If refresh repeatedly fails, mark DEAD so auto-register replaces it
+            if self.fail_count >= threshold:
+                self.status = TokenStatus.DEAD
+                logger.warning(f"Token {self.email} marked DEAD (refresh failed {self.fail_count} times)")
         elif self.fail_count >= threshold:
             self.status = TokenStatus.DEAD
             logger.warning(f"Token {self.email} marked DEAD (fail_count={self.fail_count})")
