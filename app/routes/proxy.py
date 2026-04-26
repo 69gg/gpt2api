@@ -31,7 +31,7 @@ def _stream_chunks(resp):
 @router.get("/p/img/{encoded_url:path}")
 async def proxy_image(encoded_url: str, request: Request):
     estuary_url = _decode_url(encoded_url)
-    if not estuary_url or "estuary" not in estuary_url:
+    if not estuary_url or ("estuary" not in estuary_url and "oaiusercontent" not in estuary_url and "openai" not in estuary_url):
         raise HTTPException(status_code=400, detail="Invalid image URL")
 
     tm = request.app.state.token_manager

@@ -103,7 +103,7 @@ class OpenAIChatAdapter:
         img_client._last_conv_id = conv_id
 
         # Poll for image URL
-        image_url = img_client._poll_for_image(conv_id, msg_id, "", max_wait=max_wait)
+        image_url, _ = img_client._poll_for_image(conv_id, msg_id, "", max_wait=max_wait)
 
         if image_url and self.deployment_url:
             image_url = _make_proxy_url(image_url, self.deployment_url)

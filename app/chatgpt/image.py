@@ -102,20 +102,27 @@ class ImageClient:
         # Image generation is asynchronous: the tool message with asset_pointer
         # may not appear until the image is fully rendered.
         if result.conversation_id and not result.image_url:
-            result.image_url = self._poll_for_image(
+            polled_url, polled_ap = self._poll_for_image(
                 result.conversation_id, result.message_id, asset_pointer,
                 max_wait=300,
             )
+            if polled_url:
+                result.image_url = polled_url
+            if polled_ap:
+                asset_pointer = polled_ap
 
         result.asset_pointer = asset_pointer
         result.status = "success" if result.image_url else "failed"
         return result
 
     def _poll_for_image(self, conversation_id: str, message_id: str,
-                        asset_pointer: str, max_wait: int = 60) -> str:
-        """Poll /backend-api/conversation/{id} for completed image URL."""
+                        asset_pointer: str, max_wait: int = 60) -> tuple:
+        """Poll /backend-api/conversation/{id} for completed image URL.
+
+        Returns (image_url, asset_pointer) tuple.
+        """
         if not conversation_id:
-            return ""
+            return "", ""
 
         path = f"/backend-api/conversation/{conversation_id}"
         deadline = time.time() + max_wait
@@ -153,41 +160,42 @@ class ImageClient:
                         for part in parts:
                             if isinstance(part, str) and ("error" in part.lower() or "failed" in part.lower()):
                                 logger.debug(f"Poll: upstream image gen failed: {part[:80]}")
-                                return ""
+                                return "", ""
 
                     # Check for image content types
-                    if content_type in ("image_asset_pointer", "multimodal_text"):
-                        for part in parts:
-                            if isinstance(part, dict):
-                                url = part.get("image_url") or part.get("url") or ""
-                                if url:
-                                    logger.debug(f"Poll: found image_url in {content_type}")
-                                    return url
-                                ap = part.get("asset_pointer", "")
-                                if ap:
-                                    logger.debug(f"Poll: found asset_pointer={ap[:50]} in {content_type}")
-                                    dl = self._download_asset(ap)
-                                    if dl:
-                                        logger.debug(f"Poll: download_url={dl[:80]}")
-                                        return dl
+                    for part in parts:
+                        if isinstance(part, dict):
+                            url = part.get("image_url") or part.get("url") or ""
+                            if url:
+                                logger.debug(f"Poll: found image_url in {content_type}")
+                                ap = part.get("asset_pointer", "") or asset_pointer
+                                return url, ap
+                            ap = part.get("asset_pointer", "")
+                            if ap:
+                                logger.debug(f"Poll: found asset_pointer={ap[:50]} in {content_type}")
+                                dl = self._download_asset(ap)
+                                if dl:
+                                    logger.debug(f"Poll: download_url={dl[:80]}")
+                                    return dl, ap
 
                     # Also check any message for image URLs or asset pointers
                     for part in parts:
                         if isinstance(part, dict):
                             url = part.get("image_url") or part.get("url") or ""
                             if url and ("oaiusercontent" in url or "openai" in url):
-                                return url
+                                ap = part.get("asset_pointer", "") or asset_pointer
+                                return url, ap
                             ap = part.get("asset_pointer", "")
                             if ap and (ap.startswith("file-service://") or ap.startswith("sediment://")):
                                 dl_url = self._download_asset(ap)
                                 if dl_url:
-                                    return dl_url
+                                    return dl_url, ap
                         elif isinstance(part, str):
                             if part.startswith("http") and (
                                 "oaiusercontent" in part or
                                 "openai" in part
                             ):
-                                return part
+                                return part, asset_pointer
 
                 # Check if conversation is still generating
                 # Look for async_status in the response
@@ -216,7 +224,7 @@ class ImageClient:
 
             time.sleep(3)
 
-        return ""
+        return "", ""
 
     def _download_asset(self, asset_pointer: str) -> str:
         """Get a signed download URL from asset_pointer.

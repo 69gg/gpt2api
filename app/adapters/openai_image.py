@@ -211,8 +211,14 @@ class OpenAIImageAdapter:
         impersonate = token.impersonate or "chrome136"
         headers = {
             "Referer": "https://chatgpt.com/",
+            "Origin": "https://chatgpt.com",
             "User-Agent": token.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         }
+        if token.access_token:
+            headers["Authorization"] = f"Bearer {token.access_token}"
+        if token.device_id:
+            headers["Oai-Device-Id"] = token.device_id
 
         download_url = result.image_url
 
