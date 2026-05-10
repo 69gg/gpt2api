@@ -154,3 +154,44 @@ async def health(request: Request):
         "status": "ok",
         "tokens": tm.get_stats(),
     })
+
+
+# ---------- v1 admin router (how2use 兼容接口) ----------
+
+v1_admin_router = APIRouter(prefix="/v1/admin")
+
+
+@v1_admin_router.get("/tokens")
+async def v1_list_tokens(request: Request):
+    """返回按 pool 分组的 token 快照，供 how2use 消费。
+
+    response::
+
+      {
+        "tokens": {
+          "default": [
+            {
+              "token": "user@example.com",
+              "status": "active",
+              "use_count": 42,
+              "fail_count": 0,
+              "last_used_at": 1715300000000
+            }
+          ]
+        }
+      }
+    """
+    tm = _get_tm(request)
+    token_list: list[dict[str, Any]] = []
+    for t in tm.tokens:
+        last_used = None
+        if t.last_used_at is not None:
+            last_used = int(t.last_used_at * 1000)
+        token_list.append({
+            "token": t.email,
+            "status": t.status.value,
+            "use_count": t.use_count,
+            "fail_count": t.fail_count,
+            "last_used_at": last_used,
+        })
+    return JSONResponse(content={"tokens": {"default": token_list}})

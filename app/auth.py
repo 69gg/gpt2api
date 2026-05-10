@@ -26,8 +26,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         # Admin endpoints require admin key
-        if path.startswith("/admin/"):
+        if path.startswith("/admin/") or path.startswith("/v1/admin/"):
             key = request.headers.get("X-Admin-Key", "") or request.query_params.get("admin_key", "")
+            if not key:
+                auth_header = request.headers.get("Authorization", "")
+                if auth_header.startswith("Bearer "):
+                    key = auth_header[7:]
             if key != admin_key:
                 return JSONResponse(status_code=401, content={"error": "invalid_admin_key"})
             return await call_next(request)
