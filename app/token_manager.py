@@ -28,6 +28,7 @@ from app.config import get_config
 class TokenStatus(str, Enum):
     ACTIVE = "active"
     COOLING = "cooling"
+    STALE = "stale"
     EXPIRED = "expired"
     DEAD = "dead"
     DISABLED = "disabled"
@@ -192,6 +193,8 @@ class TokenInfo:
             self.status = TokenStatus.COOLING
             logger.info(f"Token {self.email} marked COOLING (quota exhausted, {cooling_hours}h)")
         elif reason == FailReason.TOKEN_EXPIRED:
+            self.status = TokenStatus.STALE
+            logger.info(f"Token {self.email} marked STALE (refresh failed, count={self.fail_count})")
             if self.fail_count >= 3:
                 self.status = TokenStatus.EXPIRED
                 logger.info(f"Token {self.email} marked EXPIRED (refresh failed {self.fail_count} times)")
@@ -327,7 +330,7 @@ class TokenManager:
 
     @property
     def active_count(self) -> int:
-        return sum(1 for t in self._tokens if t.is_available)
+        return sum(1 for t in self._tokens if t.status in (TokenStatus.ACTIVE, TokenStatus.STALE) and t.access_token)
 
     @property
     def total_count(self) -> int:
