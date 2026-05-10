@@ -192,12 +192,9 @@ class TokenInfo:
             self.status = TokenStatus.COOLING
             logger.info(f"Token {self.email} marked COOLING (quota exhausted, {cooling_hours}h)")
         elif reason == FailReason.TOKEN_EXPIRED:
-            self.status = TokenStatus.EXPIRED
-            logger.info(f"Token {self.email} marked EXPIRED")
-            # If refresh repeatedly fails, mark DEAD so auto-register replaces it
-            if self.fail_count >= threshold:
-                self.status = TokenStatus.DEAD
-                logger.warning(f"Token {self.email} marked DEAD (refresh failed {self.fail_count} times)")
+            if self.fail_count >= 3:
+                self.status = TokenStatus.EXPIRED
+                logger.info(f"Token {self.email} marked EXPIRED (refresh failed {self.fail_count} times)")
         elif self.fail_count >= threshold:
             self.status = TokenStatus.DEAD
             logger.warning(f"Token {self.email} marked DEAD (fail_count={self.fail_count})")
@@ -383,9 +380,7 @@ class TokenManager:
             if resp.status_code != 200:
                 error_text = resp.text[:200]
                 logger.error(f"Token refresh failed for {token.email}: {resp.status_code} {error_text}")
-                # Check if refresh_token is also expired
-                if resp.status_code in (400, 401):
-                    token.record_failure(FailReason.TOKEN_EXPIRED)
+                token.record_failure(FailReason.TOKEN_EXPIRED)
                 return False
 
             data = resp.json()
@@ -396,6 +391,7 @@ class TokenManager:
 
             if not new_access:
                 logger.error(f"Refresh returned empty access_token for {token.email}")
+                token.record_failure(FailReason.TOKEN_EXPIRED)
                 return False
 
             token.access_token = new_access
@@ -417,17 +413,21 @@ class TokenManager:
 
         except Exception as e:
             logger.error(f"Token refresh error for {token.email}: {e}")
+            token.record_failure(FailReason.TOKEN_EXPIRED)
             return False
 
     # ---------- Scheduled Tasks ----------
 
     async def refresh_expired_tokens(self) -> int:
-        """Refresh all expired tokens. Returns count of successfully refreshed."""
+        """Refresh all (non-dead, non-disabled) tokens. Returns count of successfully refreshed."""
         refreshed = 0
         for token in self._tokens:
-            if token.status == TokenStatus.EXPIRED or (token.is_expired and token.status == TokenStatus.ACTIVE):
-                if await self.refresh_token(token):
-                    refreshed += 1
+            if token.status in (TokenStatus.DEAD, TokenStatus.DISABLED):
+                continue
+            if not token.refresh_token:
+                continue
+            if await self.refresh_token(token):
+                refreshed += 1
         return refreshed
 
     async def check_cooling_tokens(self) -> int:
