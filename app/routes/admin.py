@@ -161,6 +161,39 @@ async def health(request: Request):
 v1_admin_router = APIRouter(prefix="/v1/admin")
 
 
+@v1_admin_router.get("/tokens/counts")
+async def v1_token_counts(request: Request):
+    """返回按 pool 分组的 token 统计计数（轻量，不含完整 token 数据）
+
+    response::
+
+      {
+        "pools": {
+          "default": {
+            "total": 490,
+            "active": 478,
+            "cooling": 0,
+            "expired": 0,
+            "disabled": 12
+          }
+        }
+      }
+    """
+    tm = _get_tm(request)
+    counts = _count_by_status(tm)
+    return JSONResponse(content={"pools": {"default": counts}})
+
+
+def _count_by_status(tm: TokenManager) -> dict[str, int]:
+    result = {"total": 0, "active": 0, "cooling": 0, "expired": 0, "disabled": 0}
+    for t in tm.tokens:
+        result["total"] += 1
+        s = t.status.value
+        if s in result:
+            result[s] += 1
+    return result
+
+
 @v1_admin_router.get("/tokens")
 async def v1_list_tokens(request: Request):
     """返回按 pool 分组的 token 快照，供 how2use 消费。
