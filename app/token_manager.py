@@ -330,7 +330,7 @@ class TokenManager:
 
     @property
     def active_count(self) -> int:
-        return sum(1 for t in self._tokens if t.status in (TokenStatus.ACTIVE, TokenStatus.STALE) and t.access_token)
+        return sum(1 for t in self._tokens if t.is_available)
 
     @property
     def total_count(self) -> int:
