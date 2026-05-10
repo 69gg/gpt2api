@@ -202,6 +202,8 @@ class TokenInfo:
             self.status = TokenStatus.DEAD
             logger.warning(f"Token {self.email} marked DEAD (fail_count={self.fail_count})")
 
+        self.save()
+
     def save(self) -> None:
         if not self._path:
             return
