@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from curl_cffi import requests
+from loguru import logger
 
 # ==================== 常量 ====================
 BASE_DIR = Path(__file__).parent.parent.resolve()
