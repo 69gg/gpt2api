@@ -31,6 +31,8 @@ chatgpt:
   turnstile_solver_url: ""         # 外部 Turnstile 求解器（可选）
 
 models:
+  - id: "gpt-5.5"
+    upstream: "gpt-5-5"
   - id: "gpt-5.3"
     upstream: "gpt-5-3"
   - id: "gpt-5.2"
