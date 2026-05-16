@@ -186,7 +186,7 @@ class TokenInfo:
 
         if reason == FailReason.BANNED:
             self.status = TokenStatus.DEAD
-            logger.warning(f"Token {self.email} marked DEAD (banned)")
+            logger.warning(f"Token {self.email} marked DEAD (banned), will be deleted")
         elif reason == FailReason.QUOTA_EXHAUSTED:
             cooling_hours = get_config("token.cooling_reset_hours", 24)
             self.cooldown_until = time.time() + cooling_hours * 3600
@@ -197,12 +197,29 @@ class TokenInfo:
             logger.info(f"Token {self.email} marked STALE (refresh failed, count={self.fail_count})")
             if self.fail_count >= 3:
                 self.status = TokenStatus.EXPIRED
-                logger.info(f"Token {self.email} marked EXPIRED (refresh failed {self.fail_count} times)")
+                logger.info(f"Token {self.email} marked EXPIRED (refresh failed {self.fail_count} times), will be deleted")
         elif self.fail_count >= threshold:
             self.status = TokenStatus.DEAD
-            logger.warning(f"Token {self.email} marked DEAD (fail_count={self.fail_count})")
+            logger.warning(f"Token {self.email} marked DEAD (fail_count={self.fail_count}), will be deleted")
+
+        # Unrecoverable states: delete file instead of saving
+        if self.status in (TokenStatus.EXPIRED, TokenStatus.DEAD):
+            self._delete_file()
+            return
 
         self.save()
+
+    def _delete_file(self) -> None:
+        """Delete the token JSON file from disk."""
+        if not self._path:
+            return
+        try:
+            path = Path(self._path)
+            if path.exists():
+                path.unlink()
+                logger.info(f"Deleted token file: {path.name}")
+        except Exception as e:
+            logger.error(f"Failed to delete token file {self._path}: {e}")
 
     def save(self) -> None:
         if not self._path:
@@ -422,10 +439,10 @@ class TokenManager:
     # ---------- Scheduled Tasks ----------
 
     async def refresh_expired_tokens(self) -> int:
-        """Refresh all (non-dead, non-disabled) tokens. Returns count of successfully refreshed."""
+        """Refresh all (non-dead, non-expired, non-disabled) tokens. Returns count of successfully refreshed."""
         refreshed = 0
         for token in self._tokens:
-            if token.status in (TokenStatus.DEAD, TokenStatus.DISABLED):
+            if token.status in (TokenStatus.DEAD, TokenStatus.DISABLED, TokenStatus.EXPIRED):
                 continue
             if not token.refresh_token:
                 continue
