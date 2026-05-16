@@ -87,6 +87,41 @@ class ChatResult:
     is_image: bool = False
     image_url: str = ""
     asset_pointer: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count estimation.
+
+    Heuristic: CJK chars ~1.5 tokens each, ASCII words ~1 token each,
+    punctuation/whitespace ~0.5 tokens each. Simplified to:
+    - Count CJK characters (each ≈ 1-2 tokens)
+    - Split remaining by whitespace, each word ≈ 1-1.5 tokens
+    - Add a small overhead for formatting
+    """
+    if not text:
+        return 0
+    cjk = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf')
+    # For ASCII-heavy text, use len/4 as baseline; for CJK, use char count * 1.3
+    ascii_chars = len(text) - cjk
+    return max(1, int(cjk * 1.3 + ascii_chars / 3.5))
+
+
+def estimate_messages_tokens(messages: List[Dict[str, Any]]) -> int:
+    """Estimate total tokens for a list of chat messages."""
+    total = 0
+    for msg in messages:
+        # Each message has ~4 tokens overhead (role, formatting)
+        total += 4
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total += estimate_tokens(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total += estimate_tokens(part.get("text", ""))
+    return total
 
 
 class ChatGPTClient:
@@ -408,6 +443,10 @@ class ChatGPTClient:
                 result.finish_reason = msg.finish_reason
 
         result.content = "".join(content_parts)
+
+        # Estimate token usage
+        result.prompt_tokens = estimate_messages_tokens(opts.messages)
+        result.completion_tokens = estimate_tokens(result.content)
         return result
 
     async def chat_stream(self, opts: ChatOptions) -> AsyncGenerator[ChatMessage, None]:

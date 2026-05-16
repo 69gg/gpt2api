@@ -11,7 +11,7 @@ from typing import Any, AsyncGenerator, Dict, Generator, List, Optional
 
 from loguru import logger
 
-from app.chatgpt.client import ChatGPTClient, ChatOptions, ChatResult
+from app.chatgpt.client import ChatGPTClient, ChatOptions, ChatResult, estimate_tokens, estimate_messages_tokens
 from app.chatgpt.sse import ChatMessage
 from app.chatgpt.tool_call import (
     build_tool_prompt, format_tool_history, parse_tool_calls, ToolCallStreamParser,
@@ -419,9 +419,9 @@ class OpenAIChatAdapter:
                     "finish_reason": finish_reason,
                 }],
                 "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
+                    "prompt_tokens": result.prompt_tokens,
+                    "completion_tokens": result.completion_tokens,
+                    "total_tokens": result.prompt_tokens + result.completion_tokens,
                 },
             }
         except Exception as e:
@@ -628,12 +628,22 @@ class OpenAIChatAdapter:
 
             finish_reason = "tool_calls" if tool_calls_seen else "stop"
             logger.info(f"Stream [{token.email}]: finished, content_len={content_len}, has_image={bool(image_url)}, tool_calls={tool_calls_seen}")
+
+            # Estimate token usage
+            prompt_toks = estimate_messages_tokens(opts.messages)
+            comp_toks = max(1, content_len // 4) if content_len > 0 else 0
+
             finish_chunk = {
                 "id": chat_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                "usage": {
+                    "prompt_tokens": prompt_toks,
+                    "completion_tokens": comp_toks,
+                    "total_tokens": prompt_toks + comp_toks,
+                },
             }
             yield f"data: {json.dumps(finish_chunk)}\n\n"
 

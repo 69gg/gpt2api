@@ -84,6 +84,7 @@ class OpenAIResponseAdapter:
 
         # Convert chat completion to Responses format
         content_text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        usage = result.get("usage", {})
         return {
             "id": f"resp-{uuid.uuid4().hex[:24]}",
             "object": "response",
@@ -101,9 +102,9 @@ class OpenAIResponseAdapter:
                 }],
             }],
             "usage": {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
             },
         }
 

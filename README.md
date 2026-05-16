@@ -66,7 +66,7 @@ register:
   min_tokens: 3                    # 最少保持的 token 数
 
 token:
-  refresh_interval_minutes: 10      # 自动刷新过期 token 间隔（分钟）
+  refresh_interval_hours: 2        # 自动刷新过期 token 间隔（小时）
   dead_retain_hours: 24            # 死 token 保留时间
   cooling_reset_hours: 24          # 冷却重置时间
   fail_threshold: 5                # 失败多少次标记为 dead
@@ -80,16 +80,28 @@ chatgpt:
   turnstile_solver_url: ""         # 外部 Turnstile 求解器（可选）
 
 models:                             # 可用模型列表（对应 chatgpt.com 实际模型）
+  - id: "gpt-5.5"
+    upstream: "gpt-5-5"
   - id: "gpt-5.3"
+    upstream: "gpt-5-3"
   - id: "gpt-5.2"
+    upstream: "gpt-5-2"
   - id: "gpt-5.1"
+    upstream: "gpt-5-1"
   - id: "gpt-5"
+    upstream: "gpt-5"
   - id: "gpt-5-mini"
+    upstream: "gpt-5-mini"
   - id: "gpt-5.3-mini"
+    upstream: "gpt-5-3-mini"
   - id: "gpt-5.4-mini-thinking"
+    upstream: "gpt-5-4-t-mini"
   - id: "auto"
+    upstream: "auto"
   - id: "research"
+    upstream: "research"
   - id: "gpt-image-2"
+    upstream: "gpt-5-3"
     type: "image"
 ```
 
@@ -98,7 +110,7 @@ models:                             # 可用模型列表（对应 chatgpt.com �
 ```bash
 export GPT2API_SERVER_API_KEY=sk-xxxx
 export GPT2API_CHATGPT_PROXY=http://127.0.0.1:7890
-export GPT2API_TOKEN_REFRESH_INTERVAL_MINUTES=10
+export GPT2API_TOKEN_REFRESH_INTERVAL_HOURS=2
 ```
 
 ### 3. 启动服务
@@ -123,7 +135,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-gpt2api" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o",
+    "model": "gpt-5.3",
     "messages": [{"role":"user","content":"你好"}],
     "stream": true
   }'
@@ -154,6 +166,10 @@ curl http://localhost:8000/v1/images/generations \
     "prompt": "a cat in space"
   }'
 ```
+
+## Token 使用量估算
+
+服务返回 `usage` 字段，包含估算的 token 数量（`prompt_tokens`、`completion_tokens`、`total_tokens`）。估算基于内容长度的启发式算法，非精确计算。流式请求的 usage 在最后一个 chunk 的 `usage` 字段中返回。
 
 ## Token 格式
 
@@ -265,6 +281,19 @@ curl -X DELETE http://localhost:8000/admin/tokens/email@example.com \
   -H "X-Admin-Key: admin-gpt2api"
 ```
 
+## 架构
+
+服务采用**全异步架构**，基于 `curl_cffi.AsyncSession`（libcurl multi 接口）实现真正异步 I/O：
+
+- 所有 HTTP 请求（bootstrap、chat-requirements、POW、prepare、SSE 流、图片轮询、token 刷新）均使用 `AsyncSession`，不阻塞事件循环
+- 流式响应通过 async generator 直接输出，无需线程桥接
+- POW 计算（CPU 密集）通过 `asyncio.to_thread()` 包装，仅此一处使用线程池
+- 单进程可处理数千并发连接
+
+```
+请求 → async def → AsyncSession (libcurl multi) → 事件循环不阻塞 → 并发处理
+```
+
 ## 目录结构
 
 ```
@@ -284,8 +313,8 @@ gpt2api/
 │   ├── chatgpt/
 │   │   ├── client.py       # Web Chat 客户端 (f/conversation)
 │   │   ├── sentinel.py     # Sentinel + POW 解算
-│   │   ├── retry.py        # 重试工具
-│   │   ├── sse.py          # SSE 流解析
+│   │   ├── retry.py        # 重试工具（同步 + 异步）
+│   │   ├── sse.py          # SSE 流解析（同步 + 异步）
 │   │   ├── image.py        # 图片生成
 │   │   └── turnstile.py    # Turnstile 求解器（外部服务/VM）
 │   ├── adapters/
@@ -306,7 +335,7 @@ gpt2api/
 
 服务启动后自动启动 5 个后台任务：
 
-1. **Token 刷新**（默认每 10 分钟）：用 `refresh_token` 换取新的 `access_token`
+1. **Token 刷新**（默认每 2 小时）：用 `refresh_token` 换取新的 `access_token`
 2. **冷却恢复**（每 10 分钟）：配额耗尽的 token 等待冷却期后恢复 active
 3. **新 Token 扫描**（每 30 秒）：检测 `web_token/` 目录新增的文件
 4. **死 Token 清理**（每小时）：删除超过保留期的 dead token
@@ -319,3 +348,4 @@ gpt2api/
 - **Platform OAuth token 可直接用于 `chatgpt.com` 的 Web Chat API**，无需单独获取 webchat token；服务端通过 `SentinelClient` 自动处理 chat-requirements + POW
 - SSE 流已适配 `chatgpt.com` 最新的 `delta` 事件 + JSON Patch 增量格式
 - 免费账号有配额限制，建议用多个 token 轮询分担负载
+- Token 使用量为估算值（基于内容长度的启发式算法），非精确计算

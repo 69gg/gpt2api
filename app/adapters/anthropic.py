@@ -81,6 +81,7 @@ class AnthropicAdapter:
             return {"type": "error", "error": {"type": "api_error", "message": result.get("message", "Unknown error")}}
 
         content_text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        usage = result.get("usage", {})
         return {
             "id": f"msg_{uuid.uuid4().hex[:24]}",
             "type": "message",
@@ -90,8 +91,8 @@ class AnthropicAdapter:
             "stop_reason": "end_turn",
             "stop_sequence": None,
             "usage": {
-                "input_tokens": 0,
-                "output_tokens": 0,
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
             },
         }
 
