@@ -7,7 +7,7 @@ import asyncio
 import json
 import time
 import uuid
-from typing import Any, AsyncGenerator, Dict, Generator, List, Optional
+from typing import Any, AsyncGenerator, Dict, Generator, List, Optional, Tuple
 
 from loguru import logger
 
@@ -296,9 +296,10 @@ class OpenAIChatAdapter:
     def _build_messages(self, messages: List[Dict[str, Any]],
                         tools: List[Dict[str, Any]] = None,
                         tool_choice: Any = None,
-                        parallel_tool_calls: bool = True) -> List[Dict[str, Any]]:
+                        parallel_tool_calls: bool = True) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Convert OpenAI messages to ChatGPT format.
 
+        Returns (messages, attachments) tuple.
         If tools are provided, tool-related messages are converted to text form
         and a tool-calling contract prompt is prepended.
         """
@@ -307,14 +308,33 @@ class OpenAIChatAdapter:
             messages = format_tool_history(messages)
 
         result = []
+        attachments = []
+
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
+
             if role == "system":
                 result.append({"role": "user", "content": f"[System Instructions]\n{content}"})
                 result.append({"role": "assistant", "content": "Understood."})
             elif role in ("user", "assistant"):
-                result.append({"role": role, "content": content})
+                # Check for multimodal content (list of parts)
+                if isinstance(content, list):
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict):
+                            if part.get("type") == "text":
+                                text_parts.append(part.get("text", ""))
+                            elif part.get("type") == "image_url":
+                                # Extract image for later upload
+                                image_url_data = part.get("image_url", {})
+                                url = image_url_data.get("url", "") if isinstance(image_url_data, dict) else str(image_url_data)
+                                if url:
+                                    attachments.append({"type": "image_url", "url": url})
+                    text = "\n".join(text_parts)
+                    result.append({"role": role, "content": text})
+                else:
+                    result.append({"role": role, "content": content})
             elif role == "tool":
                 # Already handled by format_tool_history above
                 pass
@@ -326,7 +346,63 @@ class OpenAIChatAdapter:
                 result.insert(0, {"role": "user", "content": tool_prompt})
                 result.insert(1, {"role": "assistant", "content": "Understood. I will follow the tool calling contract."})
 
-        return result
+        return result, attachments
+
+    async def _upload_openai_images(self, client: ChatGPTClient,
+                                     attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Upload OpenAI-format image attachments to ChatGPT file service.
+
+        Returns list of attachment dicts suitable for ChatOptions.attachments.
+        """
+        if not attachments:
+            return []
+
+        uploaded = []
+        for att in attachments:
+            url = att.get("url", "")
+            if not url:
+                continue
+
+            try:
+                if url.startswith("data:"):
+                    # Base64 data URI: data:image/png;base64,...
+                    header, b64data = url.split(",", 1)
+                    # Extract mime type
+                    mime = "image/png"
+                    if "image/jpeg" in header or "image/jpg" in header:
+                        mime = "image/jpeg"
+                    elif "image/webp" in header:
+                        mime = "image/webp"
+                    elif "image/gif" in header:
+                        mime = "image/gif"
+
+                    import base64
+                    file_bytes = base64.b64decode(b64data)
+                    ext = mime.split("/")[-1].replace("jpeg", "jpg")
+                    meta = await client.upload_file(
+                        file_bytes, filename=f"image.{ext}", mime_type=mime)
+                    uploaded.append(meta)
+                    logger.debug(f"Uploaded base64 image: {meta.get('file_id', '?')}")
+                elif url.startswith("http"):
+                    # Download image from URL then upload
+                    from curl_cffi.requests import AsyncSession
+                    async with AsyncSession(timeout=30) as dl_session:
+                        resp = await dl_session.get(url)
+                        if resp.status_code == 200:
+                            content_type = resp.headers.get("Content-Type", "image/png")
+                            if ";" in content_type:
+                                content_type = content_type.split(";")[0].strip()
+                            ext = content_type.split("/")[-1].replace("jpeg", "jpg")
+                            meta = await client.upload_file(
+                                resp.content, filename=f"image.{ext}", mime_type=content_type)
+                            uploaded.append(meta)
+                            logger.debug(f"Uploaded URL image: {meta.get('file_id', '?')}")
+                        else:
+                            logger.warning(f"Failed to download image: HTTP {resp.status_code}")
+            except Exception as e:
+                logger.warning(f"Failed to upload image: {e}")
+
+        return uploaded
 
     async def chat_completion(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Handle non-streaming chat completion request."""
@@ -345,7 +421,7 @@ class OpenAIChatAdapter:
         tools = request.get("tools")
         tool_choice = request.get("tool_choice")
         parallel_tool_calls = request.get("parallel_tool_calls", True)
-        messages = self._build_messages(
+        messages, openai_attachments = self._build_messages(
             request.get("messages", []),
             tools=tools, tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
@@ -362,11 +438,15 @@ class OpenAIChatAdapter:
             if last.get("role") == "user":
                 last["content"] = f"根据以下要求生成图片：{last['content']}"
 
+        # Upload OpenAI-format images to ChatGPT file service
+        attachments = await self._upload_openai_images(client, openai_attachments)
+
         opts = ChatOptions(
             messages=messages,
             model=upstream_model,
             sse_timeout=self.sse_timeout,
             system_hints=system_hints,
+            attachments=attachments,
         )
 
         try:
@@ -461,7 +541,7 @@ class OpenAIChatAdapter:
         tools = request.get("tools")
         tool_choice = request.get("tool_choice")
         parallel_tool_calls = request.get("parallel_tool_calls", True)
-        messages = self._build_messages(
+        messages, openai_attachments = self._build_messages(
             request.get("messages", []),
             tools=tools, tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
@@ -481,11 +561,15 @@ class OpenAIChatAdapter:
             if last.get("role") == "user":
                 last["content"] = f"根据以下要求生成图片：{last['content']}"
 
+        # Upload OpenAI-format images to ChatGPT file service
+        attachments = await self._upload_openai_images(client, openai_attachments)
+
         opts = ChatOptions(
             messages=messages,
             model=upstream_model,
             sse_timeout=self.sse_timeout,
             system_hints=system_hints,
+            attachments=attachments,
         )
 
         # Set up tool stream parser if tools are provided
