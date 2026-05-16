@@ -21,8 +21,12 @@ class OpenAIResponseAdapter:
     def __init__(self, chat_adapter: OpenAIChatAdapter):
         self.chat_adapter = chat_adapter
 
-    def _convert_input(self, input_data: Any) -> List[Dict[str, str]]:
-        """Convert Responses API input to chat messages."""
+    def _convert_input(self, input_data: Any) -> List[Dict[str, Any]]:
+        """Convert Responses API input to chat messages.
+
+        Preserves image parts as OpenAI-format content array so the
+        chat adapter can upload them to ChatGPT file service.
+        """
         if isinstance(input_data, str):
             return [{"role": "user", "content": input_data}]
 
@@ -36,15 +40,33 @@ class OpenAIResponseAdapter:
                         if isinstance(content, str):
                             messages.append({"role": "user", "content": content})
                         elif isinstance(content, list):
-                            # Handle content parts
-                            text_parts = []
+                            # Handle content parts — preserve images
+                            parts = []
                             for part in content:
-                                if isinstance(part, dict) and part.get("type") == "input_text":
-                                    text_parts.append(part.get("text", ""))
+                                if isinstance(part, dict):
+                                    if part.get("type") == "input_text":
+                                        parts.append({"type": "text", "text": part.get("text", "")})
+                                    elif part.get("type") == "input_image":
+                                        # Responses API image format
+                                        image_url = part.get("image_url", "")
+                                        detail = part.get("detail", "auto")
+                                        if image_url:
+                                            parts.append({
+                                                "type": "image_url",
+                                                "image_url": {"url": image_url, "detail": detail},
+                                            })
+                                    elif part.get("type") == "image_url":
+                                        # Already in OpenAI format
+                                        parts.append(part)
                                 elif isinstance(part, str):
-                                    text_parts.append(part)
-                            if text_parts:
-                                messages.append({"role": "user", "content": "\n".join(text_parts)})
+                                    parts.append({"type": "text", "text": part})
+                            if parts:
+                                # If only text parts, join as string; otherwise keep as array
+                                text_only = all(p.get("type") == "text" for p in parts)
+                                if text_only:
+                                    messages.append({"role": "user", "content": "\n".join(p["text"] for p in parts)})
+                                else:
+                                    messages.append({"role": "user", "content": parts})
                     elif role == "system":
                         content = item.get("content", "")
                         if isinstance(content, str):

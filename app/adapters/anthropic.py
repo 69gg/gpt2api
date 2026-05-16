@@ -28,8 +28,12 @@ class AnthropicAdapter:
     def __init__(self, chat_adapter: OpenAIChatAdapter):
         self.chat_adapter = chat_adapter
 
-    def _convert_messages(self, messages: List[Dict], system: str = "") -> List[Dict[str, str]]:
-        """Convert Anthropic messages format to OpenAI format."""
+    def _convert_messages(self, messages: List[Dict], system: str = "") -> List[Dict[str, Any]]:
+        """Convert Anthropic messages format to OpenAI format.
+
+        Preserves images as OpenAI-format content array so the
+        chat adapter can upload them to ChatGPT file service.
+        """
         result = []
         if system:
             result.append({"role": "system", "content": system})
@@ -39,18 +43,42 @@ class AnthropicAdapter:
             content = msg.get("content", "")
 
             if isinstance(content, list):
-                # Anthropic content blocks
-                text_parts = []
+                # Anthropic content blocks — convert to OpenAI format
+                parts = []
                 for block in content:
                     if isinstance(block, dict):
                         if block.get("type") == "text":
-                            text_parts.append(block.get("text", ""))
+                            parts.append({"type": "text", "text": block.get("text", "")})
                         elif block.get("type") == "image":
-                            # Skip images for web chat
-                            pass
+                            # Anthropic image format → OpenAI image_url
+                            source = block.get("source", {})
+                            source_type = source.get("type", "")
+                            if source_type == "base64":
+                                media_type = source.get("media_type", "image/png")
+                                data = source.get("data", "")
+                                if data:
+                                    parts.append({
+                                        "type": "image_url",
+                                        "image_url": {"url": f"data:{media_type};base64,{data}"},
+                                    })
+                            elif source_type == "url":
+                                url = source.get("url", "")
+                                if url:
+                                    parts.append({
+                                        "type": "image_url",
+                                        "image_url": {"url": url},
+                                    })
                     elif isinstance(block, str):
-                        text_parts.append(block)
-                content = "\n".join(text_parts)
+                        parts.append({"type": "text", "text": block})
+
+                if parts:
+                    text_only = all(p.get("type") == "text" for p in parts)
+                    if text_only:
+                        content = "\n".join(p["text"] for p in parts)
+                    else:
+                        content = parts
+                else:
+                    content = ""
 
             if role in ("user", "assistant"):
                 result.append({"role": role, "content": content})
