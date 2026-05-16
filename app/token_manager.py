@@ -359,62 +359,60 @@ class TokenManager:
             return False
 
         try:
-            from curl_cffi import requests as curl_requests
+            from curl_cffi.requests import AsyncSession
 
             TOKEN_URL = "https://auth.openai.com/oauth/token"
             client_id = token.client_id or "app_2SKx67EdpoN0G6j64rFvigXD"
 
             proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
 
-            resp = curl_requests.post(
-                TOKEN_URL,
-                data={
-                    "grant_type": "refresh_token",
-                    "client_id": client_id,
-                    "refresh_token": token.refresh_token,
-                },
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                },
-                proxies=proxies,
-                impersonate="chrome131",
-                timeout=30,
-            )
+            async with AsyncSession(impersonate="chrome131", proxies=proxies, timeout=30) as session:
+                resp = await session.post(
+                    TOKEN_URL,
+                    data={
+                        "grant_type": "refresh_token",
+                        "client_id": client_id,
+                        "refresh_token": token.refresh_token,
+                    },
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Accept": "application/json",
+                    },
+                )
 
-            if resp.status_code != 200:
-                error_text = resp.text[:200]
-                logger.error(f"Token refresh failed for {token.email}: {resp.status_code} {error_text}")
-                token.record_failure(FailReason.TOKEN_EXPIRED)
-                return False
+                if resp.status_code != 200:
+                    error_text = resp.text[:200]
+                    logger.error(f"Token refresh failed for {token.email}: {resp.status_code} {error_text}")
+                    token.record_failure(FailReason.TOKEN_EXPIRED)
+                    return False
 
-            data = resp.json()
-            new_access = str(data.get("access_token") or "").strip()
-            new_refresh = str(data.get("refresh_token") or "").strip()
-            new_id_token = str(data.get("id_token") or "").strip()
-            expires_in = int(data.get("expires_in", 3600))
+                data = resp.json()
+                new_access = str(data.get("access_token") or "").strip()
+                new_refresh = str(data.get("refresh_token") or "").strip()
+                new_id_token = str(data.get("id_token") or "").strip()
+                expires_in = int(data.get("expires_in", 3600))
 
-            if not new_access:
-                logger.error(f"Refresh returned empty access_token for {token.email}")
-                token.record_failure(FailReason.TOKEN_EXPIRED)
-                return False
+                if not new_access:
+                    logger.error(f"Refresh returned empty access_token for {token.email}")
+                    token.record_failure(FailReason.TOKEN_EXPIRED)
+                    return False
 
-            token.access_token = new_access
-            if new_refresh:
-                token.refresh_token = new_refresh
-            if new_id_token:
-                token.id_token = new_id_token
+                token.access_token = new_access
+                if new_refresh:
+                    token.refresh_token = new_refresh
+                if new_id_token:
+                    token.id_token = new_id_token
 
-            now = int(time.time())
-            token.last_refresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-            token.expired = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + expires_in))
-            token.status = TokenStatus.ACTIVE
-            token.fail_count = 0
-            token.last_fail_reason = None
-            token.save()
+                now = int(time.time())
+                token.last_refresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+                token.expired = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + expires_in))
+                token.status = TokenStatus.ACTIVE
+                token.fail_count = 0
+                token.last_fail_reason = None
+                token.save()
 
-            logger.info(f"Token refreshed: {token.email}")
-            return True
+                logger.info(f"Token refreshed: {token.email}")
+                return True
 
         except Exception as e:
             logger.error(f"Token refresh error for {token.email}: {e}")

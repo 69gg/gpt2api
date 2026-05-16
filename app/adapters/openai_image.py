@@ -83,7 +83,7 @@ class OpenAIImageAdapter:
 
         try:
             # 1. Upload image to ChatGPT file service
-            image_meta = chat_client.upload_file(
+            image_meta = await chat_client.upload_file(
                 image_bytes, filename="image.png", mime_type="image/png")
             logger.info(f"Edit [{token.email}]: uploaded image file_id={image_meta.get('file_id', image_meta)}")
 
@@ -91,7 +91,7 @@ class OpenAIImageAdapter:
 
             # 2. Handle mask (upload as second image if provided)
             if mask_bytes:
-                mask_meta = chat_client.upload_file(
+                mask_meta = await chat_client.upload_file(
                     mask_bytes, filename="mask.png", mime_type="image/png")
                 logger.info(f"Edit [{token.email}]: uploaded mask file_id={mask_meta.get('file_id', mask_meta)}")
                 attachments.append(mask_meta)
@@ -100,7 +100,7 @@ class OpenAIImageAdapter:
 
             # 3. Generate with attachments
             logger.info(f"Edit [{token.email}]: prompt={prompt[:60]}... attachments={len(attachments)}")
-            result = client.generate(
+            result = await client.generate(
                 prompt, model="gpt-5-3", attachments=attachments)
             logger.info(f"Edit [{token.email}]: status={result.status}, url={bool(result.image_url)}")
 
@@ -118,7 +118,7 @@ class OpenAIImageAdapter:
             logger.info(f"Edit [{token.email}]: url={proxied_url[:80]}...")
 
             if response_format == "b64_json":
-                image_data = self._download_b64(
+                image_data = await self._download_b64(
                     client, result, token, prompt)
                 if not image_data:
                     return {"error": "download_failed", "message": "Failed to download image for b64_json encoding"}
@@ -167,7 +167,7 @@ class OpenAIImageAdapter:
 
         try:
             logger.info(f"Image [{token.email}]: prompt={prompt[:60]}... model={upstream_model}")
-            result = client.generate(prompt, model=upstream_model)
+            result = await client.generate(prompt, model=upstream_model)
             logger.info(f"Image [{token.email}]: status={result.status}, url={bool(result.image_url)}, asset={result.asset_pointer[:50] if result.asset_pointer else '-'}")
 
             if result.status != "success" or not result.image_url:
@@ -184,7 +184,7 @@ class OpenAIImageAdapter:
             logger.info(f"Image [{token.email}]: url={proxied_url[:80]}...")
 
             if response_format == "b64_json":
-                image_data = self._download_b64(
+                image_data = await self._download_b64(
                     client, result, token, prompt)
                 if not image_data:
                     return {"error": "download_failed", "message": "Failed to download image for b64_json encoding"}
@@ -208,10 +208,10 @@ class OpenAIImageAdapter:
             logger.error(f"Image [{token.email}]: FAILED reason={reason} err={e}")
             return {"error": "upstream_error", "message": error_str}
 
-    def _download_b64(self, client: "ImageClient", result: "ImageResult",
+    async def _download_b64(self, client: "ImageClient", result: "ImageResult",
                       token: TokenInfo, prompt: str) -> Optional[Dict[str, Any]]:
         """Download image as base64. Returns dict with b64_json or None on failure."""
-        from curl_cffi import requests as curl_requests
+        from curl_cffi.requests import AsyncSession
 
         effective_proxy = token.get_proxy(self.proxy)
         proxies = {"http": effective_proxy, "https": effective_proxy} if effective_proxy else None
@@ -231,38 +231,39 @@ class OpenAIImageAdapter:
 
         # If asset_pointer available, get a fresh signed URL
         if result.asset_pointer:
-            fresh_url = client._download_asset(result.asset_pointer)
+            fresh_url = await client._download_asset(result.asset_pointer)
             if fresh_url:
                 download_url = fresh_url
                 logger.debug(f"b64: refreshed signed URL via asset_pointer")
 
         try:
-            resp = curl_requests.get(
-                download_url, timeout=30, proxies=proxies,
-                impersonate=impersonate, headers=headers,
-            )
-            if resp.status_code == 200:
-                return {
-                    "b64_json": base64.b64encode(resp.content).decode("ascii"),
-                    "revised_prompt": result.revised_prompt or prompt,
-                }
+            async with AsyncSession(impersonate=impersonate, proxies=proxies, timeout=30) as session:
+                resp = await session.get(
+                    download_url, headers=headers,
+                )
+                if resp.status_code == 200:
+                    import base64
+                    return {
+                        "b64_json": base64.b64encode(resp.content).decode("ascii"),
+                        "revised_prompt": result.revised_prompt or prompt,
+                    }
 
-            # If still failing, try once more with a fresh URL
-            if resp.status_code == 403 and result.asset_pointer:
-                logger.warning(f"b64 download 403, retrying with fresh signed URL")
-                fresh_url = client._download_asset(result.asset_pointer)
-                if fresh_url and fresh_url != download_url:
-                    resp = curl_requests.get(
-                        fresh_url, timeout=30, proxies=proxies,
-                        impersonate=impersonate, headers=headers,
-                    )
-                    if resp.status_code == 200:
-                        return {
-                            "b64_json": base64.b64encode(resp.content).decode("ascii"),
-                            "revised_prompt": result.revised_prompt or prompt,
-                        }
+                # If still failing, try once more with a fresh URL
+                if resp.status_code == 403 and result.asset_pointer:
+                    logger.warning(f"b64 download 403, retrying with fresh signed URL")
+                    fresh_url = await client._download_asset(result.asset_pointer)
+                    if fresh_url and fresh_url != download_url:
+                        resp = await session.get(
+                            fresh_url, headers=headers,
+                        )
+                        if resp.status_code == 200:
+                            import base64
+                            return {
+                                "b64_json": base64.b64encode(resp.content).decode("ascii"),
+                                "revised_prompt": result.revised_prompt or prompt,
+                            }
 
-            logger.warning(f"b64 download failed: HTTP {resp.status_code}")
+                logger.warning(f"b64 download failed: HTTP {resp.status_code}")
         except Exception as e:
             logger.warning(f"b64 download error: {e}")
 

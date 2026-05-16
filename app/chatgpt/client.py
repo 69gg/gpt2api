@@ -10,19 +10,23 @@ Handles:
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, Generator, List, Optional, Tuple
 
-from curl_cffi import requests as curl_requests
+from curl_cffi.requests import AsyncSession
 from loguru import logger
 
 from .sentinel import SentinelClient, POWConfig
-from .retry import retry_call
-from .sse import SSEEvent, ChatMessage, parse_sse_stream, extract_chat_messages, stream_text_from_response
+from .retry import async_retry_call
+from .sse import (
+    SSEEvent, ChatMessage,
+    async_parse_sse_stream, async_extract_chat_messages, async_stream_text_from_response,
+)
 
 
 BASE_URL = "https://chatgpt.com"
@@ -86,13 +90,14 @@ class ChatResult:
 
 
 class ChatGPTClient:
-    """ChatGPT Web Chat API client."""
+    """ChatGPT Web Chat API client (async)."""
 
     def __init__(self, access_token: str, device_id: str = "",
                  session_id: str = "", proxy: str = "",
                  user_agent: str = "", impersonate: str = "",
                  turnstile_solver_url: str = "",
-                 pow_max_iter: int = 500000):
+                 pow_max_iter: int = 500000,
+                 session: Optional[AsyncSession] = None):
         self.access_token = access_token
         self.device_id = device_id or str(uuid.uuid4())
         self.session_id = session_id or str(uuid.uuid4())
@@ -100,6 +105,7 @@ class ChatGPTClient:
         self.user_agent = user_agent or DEFAULT_USER_AGENT
         self._proxies = {"http": proxy, "https": proxy} if proxy else None
         self._impersonate = impersonate or "chrome131"
+        self._session = session  # shared AsyncSession, created lazily if None
 
         self.sentinel = SentinelClient(
             access_token=access_token,
@@ -111,6 +117,17 @@ class ChatGPTClient:
             turnstile_solver_url=turnstile_solver_url,
             pow_max_iter=pow_max_iter,
         )
+
+    def _get_session(self) -> AsyncSession:
+        """Get or create the AsyncSession (must be called within a running event loop)."""
+        if self._session is None:
+            self._session = AsyncSession(
+                impersonate=self._impersonate,
+                proxies=self._proxies,
+                timeout=30,
+                max_clients=100,
+            )
+        return self._session
 
     def _common_headers(self, path: str = "") -> Dict[str, str]:
         return {
@@ -145,7 +162,7 @@ class ChatGPTClient:
 
     # ---------- f/conversation/prepare ----------
 
-    def prepare_fchat(self, chat_token: str, proof_token: str,
+    async def prepare_fchat(self, chat_token: str, proof_token: str,
                       opts: ChatOptions) -> str:
         """POST /backend-api/f/conversation/prepare → conduit_token."""
         path = "/backend-api/f/conversation/prepare"
@@ -211,10 +228,11 @@ class ChatGPTClient:
         if proof_token:
             headers["Openai-Sentinel-Proof-Token"] = proof_token
 
-        resp = retry_call(
-            curl_requests.post,
+        session = self._get_session()
+        resp = await async_retry_call(
+            session.post,
             f"{BASE_URL}{path}", headers=headers, json=payload,
-            proxies=self._proxies, impersonate=self._impersonate, timeout=30,
+            timeout=30,
             max_retries=3, delay=2.0, backoff=2.0, label="prepare",
         )
         if resp.status_code >= 400:
@@ -228,8 +246,8 @@ class ChatGPTClient:
 
     # ---------- f/conversation (SSE) ----------
 
-    def stream_fchat(self, chat_token: str, proof_token: str,
-                     conduit_token: str, opts: ChatOptions) -> Generator[ChatMessage, None, None]:
+    async def stream_fchat(self, chat_token: str, proof_token: str,
+                     conduit_token: str, opts: ChatOptions) -> AsyncGenerator[ChatMessage, None]:
         """POST /backend-api/f/conversation → SSE stream of ChatMessage."""
         path = "/backend-api/f/conversation"
         parent_msg_id = opts.parent_message_id or str(uuid.uuid4())
@@ -330,10 +348,10 @@ class ChatGPTClient:
         if conduit_token:
             headers["Openai-Sentinel-Conduit-Api-Token"] = conduit_token
 
-        resp = retry_call(
-            curl_requests.post,
+        session = self._get_session()
+        resp = await async_retry_call(
+            session.post,
             f"{BASE_URL}{path}", headers=headers, json=payload,
-            proxies=self._proxies, impersonate=self._impersonate,
             timeout=opts.sse_timeout, stream=True,
             max_retries=2, delay=3.0, backoff=2.0, label="stream-fchat",
         )
@@ -341,37 +359,39 @@ class ChatGPTClient:
             logger.error(f"f/conversation failed: {resp.status_code} {resp.text[:200]}")
             raise RuntimeError(f"f/conversation failed: {resp.status_code} {resp.text[:200]}")
 
-        yield from extract_chat_messages(parse_sse_stream(resp))
+        async for msg in async_extract_chat_messages(async_parse_sse_stream(resp)):
+            yield msg
 
     # ---------- Full chat flow ----------
 
-    def chat(self, opts: ChatOptions) -> ChatResult:
+    async def chat(self, opts: ChatOptions) -> ChatResult:
         """Complete chat flow: bootstrap → chat-requirements → prepare → f/conversation."""
         logger.debug(f"chat(): model={opts.model}, msgs={len(opts.messages)}, conv_id={opts.conversation_id or '-'}")
         # 1. Bootstrap
-        self.sentinel.bootstrap()
+        await self.sentinel.bootstrap()
 
         # 2. Get chat requirements
-        req_result = self.sentinel.get_chat_requirements()
+        req_result = await self.sentinel.get_chat_requirements()
         chat_token = req_result.token
         if not chat_token:
             raise RuntimeError("Failed to get chat_requirements token")
 
-        # 3. Solve POW if needed
+        # 3. Solve POW if needed (CPU-bound, offload to thread)
         proof_token = ""
         if req_result.proofofwork_required and req_result.proofofwork_seed:
-            proof_token = self.sentinel.pow_config.solve_proof(
+            proof_token = await asyncio.to_thread(
+                self.sentinel.pow_config.solve_proof,
                 req_result.proofofwork_seed, req_result.proofofwork_difficulty,
                 self.sentinel.pow_max_iter,
             )
 
         # 4. Prepare
-        conduit_token = self.prepare_fchat(chat_token, proof_token, opts)
+        conduit_token = await self.prepare_fchat(chat_token, proof_token, opts)
 
         # 5. Stream f/conversation and collect result
         result = ChatResult()
         content_parts = []
-        for msg in self.stream_fchat(chat_token, proof_token, conduit_token, opts):
+        async for msg in self.stream_fchat(chat_token, proof_token, conduit_token, opts):
             if msg.content:
                 content_parts.append(msg.content)
             if msg.conversation_id:
@@ -390,30 +410,32 @@ class ChatGPTClient:
         result.content = "".join(content_parts)
         return result
 
-    def chat_stream(self, opts: ChatOptions) -> Generator[ChatMessage, None, None]:
+    async def chat_stream(self, opts: ChatOptions) -> AsyncGenerator[ChatMessage, None]:
         """Complete chat flow with streaming output."""
         logger.debug(f"chat_stream(): model={opts.model}, msgs={len(opts.messages)}, conv_id={opts.conversation_id or '-'}")
-        self.sentinel.bootstrap()
+        await self.sentinel.bootstrap()
 
-        req_result = self.sentinel.get_chat_requirements()
+        req_result = await self.sentinel.get_chat_requirements()
         chat_token = req_result.token
         if not chat_token:
             raise RuntimeError("Failed to get chat_requirements token")
 
         proof_token = ""
         if req_result.proofofwork_required and req_result.proofofwork_seed:
-            proof_token = self.sentinel.pow_config.solve_proof(
+            proof_token = await asyncio.to_thread(
+                self.sentinel.pow_config.solve_proof,
                 req_result.proofofwork_seed, req_result.proofofwork_difficulty,
                 self.sentinel.pow_max_iter,
             )
 
-        conduit_token = self.prepare_fchat(chat_token, proof_token, opts)
-        yield from self.stream_fchat(chat_token, proof_token, conduit_token, opts)
+        conduit_token = await self.prepare_fchat(chat_token, proof_token, opts)
+        async for msg in self.stream_fchat(chat_token, proof_token, conduit_token, opts):
+            yield msg
 
     # ---------- Legacy /backend-api/conversation ----------
 
-    def stream_conversation(self, chat_token: str, proof_token: str,
-                           opts: ChatOptions) -> Generator[ChatMessage, None, None]:
+    async def stream_conversation(self, chat_token: str, proof_token: str,
+                           opts: ChatOptions) -> AsyncGenerator[ChatMessage, None]:
         """POST /backend-api/conversation → SSE stream (legacy endpoint)."""
         path = "/backend-api/conversation"
         parent_msg_id = opts.parent_message_id or str(uuid.uuid4())
@@ -466,19 +488,20 @@ class ChatGPTClient:
         if proof_token:
             headers["Openai-Sentinel-Proof-Token"] = proof_token
 
-        resp = curl_requests.post(
+        session = self._get_session()
+        resp = await session.post(
             f"{BASE_URL}{path}", headers=headers, json=payload,
-            proxies=self._proxies, impersonate=self._impersonate,
             timeout=opts.sse_timeout, stream=True,
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"/conversation failed: {resp.status_code} {resp.text[:200]}")
 
-        yield from extract_chat_messages(parse_sse_stream(resp))
+        async for msg in async_extract_chat_messages(async_parse_sse_stream(resp)):
+            yield msg
 
     # ---------- File upload ----------
 
-    def upload_file(self, file_bytes: bytes, filename: str = "image.png",
+    async def upload_file(self, file_bytes: bytes, filename: str = "image.png",
                     mime_type: str = "image/png") -> Dict[str, Any]:
         """Upload a file to ChatGPT file service, return file metadata dict.
 
@@ -490,10 +513,11 @@ class ChatGPTClient:
         Returns dict with file_id, size_bytes, width, height for use as attachment.
         """
         path = "/backend-api/files"
+        session = self._get_session()
 
         # Step 1: Request presigned upload URL
-        resp = retry_call(
-            curl_requests.post,
+        resp = await async_retry_call(
+            session.post,
             f"{BASE_URL}{path}",
             headers={
                 **self._common_headers(path),
@@ -501,7 +525,7 @@ class ChatGPTClient:
                 "Content-Type": "application/json",
             },
             json={"file_name": filename, "use_case": "multimodal"},
-            proxies=self._proxies, impersonate=self._impersonate, timeout=30,
+            timeout=30,
             max_retries=3, delay=1.0, backoff=2.0, label="upload-file-init",
         )
         if resp.status_code >= 400:
@@ -516,8 +540,8 @@ class ChatGPTClient:
             raise RuntimeError(f"File upload init returned no file_id/upload_url: {data}")
 
         # Step 2: Upload file bytes to Azure Blob Storage presigned URL
-        put_resp = retry_call(
-            curl_requests.put,
+        put_resp = await async_retry_call(
+            session.put,
             upload_url,
             headers={
                 "Content-Type": mime_type,
@@ -525,7 +549,6 @@ class ChatGPTClient:
                 "Content-Length": str(len(file_bytes)),
             },
             data=file_bytes,
-            impersonate="chrome131",
             timeout=60,
             max_retries=3, delay=1.0, backoff=2.0, label="upload-file-put",
         )
@@ -534,8 +557,8 @@ class ChatGPTClient:
 
         # Step 3: Confirm upload completion
         confirm_path = f"{path}/{file_id}/uploaded"
-        confirm_resp = retry_call(
-            curl_requests.post,
+        confirm_resp = await async_retry_call(
+            session.post,
             f"{BASE_URL}{confirm_path}",
             headers={
                 **self._common_headers(confirm_path),
@@ -543,7 +566,7 @@ class ChatGPTClient:
                 "Content-Type": "application/json",
             },
             json={},
-            proxies=self._proxies, impersonate=self._impersonate, timeout=30,
+            timeout=30,
             max_retries=2, delay=1.0, backoff=2.0, label="upload-file-confirm",
         )
         if confirm_resp.status_code >= 400:
@@ -567,3 +590,10 @@ class ChatGPTClient:
 
         logger.debug(f"Upload OK: file_id={file_id}")
         return result
+
+    async def close(self) -> None:
+        """Close the underlying HTTP session."""
+        if self._session:
+            await self._session.close()
+            self._session = None
+        await self.sentinel.close()

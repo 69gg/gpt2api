@@ -7,7 +7,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from loguru import logger
-from curl_cffi import requests as curl_requests
+from curl_cffi.requests import AsyncSession
 
 router = APIRouter()
 
@@ -19,14 +19,6 @@ def _decode_url(encoded: str) -> str:
         return base64.urlsafe_b64decode(encoded.encode()).decode("utf-8")
     except Exception:
         return ""
-
-def _stream_chunks(resp):
-    try:
-        for chunk in resp.iter_content(chunk_size=8192):
-            if chunk:
-                yield chunk
-    except Exception:
-        pass
 
 @router.get("/p/img/{encoded_url:path}")
 async def proxy_image(encoded_url: str, request: Request):
@@ -55,20 +47,25 @@ async def proxy_image(encoded_url: str, request: Request):
 
     proxy = token.get_proxy("")
     proxies = {"http": proxy, "https": proxy} if proxy else None
+    impersonate = token.impersonate or "chrome136"
 
     try:
-        resp = curl_requests.get(
-            estuary_url, headers=headers, proxies=proxies,
-            impersonate=token.impersonate or "chrome136", timeout=30, stream=True,
-        )
-        if resp.status_code != 200:
-            logger.warning(f"Image proxy failed: {resp.status_code}")
-            raise HTTPException(status_code=resp.status_code)
+        async with AsyncSession(impersonate=impersonate, proxies=proxies, timeout=30) as session:
+            resp = await session.get(estuary_url, headers=headers, stream=True)
+            if resp.status_code != 200:
+                logger.warning(f"Image proxy failed: {resp.status_code}")
+                raise HTTPException(status_code=resp.status_code)
 
-        ct = resp.headers.get("Content-Type", "image/png")
-        cl = resp.headers.get("Content-Length")
-        hdrs = {"Content-Length": cl} if cl else {}
-        return StreamingResponse(_stream_chunks(resp), media_type=ct, headers=hdrs)
+            ct = resp.headers.get("Content-Type", "image/png")
+            cl = resp.headers.get("Content-Length")
+            hdrs = {"Content-Length": cl} if cl else {}
+
+            async def _async_stream_chunks():
+                async for chunk in resp.aiter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+
+            return StreamingResponse(_async_stream_chunks(), media_type=ct, headers=hdrs)
     except HTTPException:
         raise
     except Exception as e:

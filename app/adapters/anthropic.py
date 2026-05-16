@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, AsyncGenerator, Dict, Generator, List, Optional
 
 from app.adapters.openai_chat import OpenAIChatAdapter, _map_model
 
@@ -95,7 +95,7 @@ class AnthropicAdapter:
             },
         }
 
-    def create_message_stream(self, request: Dict[str, Any]) -> Generator[str, None, None]:
+    async def create_message_stream(self, request: Dict[str, Any]) -> AsyncGenerator[str, None]:
         """Handle streaming Anthropic Messages request."""
         model = request.get("model", "claude-sonnet-4-20250514")
         messages = request.get("messages", [])
@@ -138,7 +138,7 @@ class AnthropicAdapter:
         yield f"event: content_block_start\ndata: {json.dumps(content_start)}\n\n"
 
         # Stream text deltas
-        for chunk in self.chat_adapter.chat_completion_stream(chat_request):
+        async for chunk in self.chat_adapter.chat_completion_stream(chat_request):
             if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
                 try:
                     data = json.loads(chunk[6:].strip())

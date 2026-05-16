@@ -6,19 +6,19 @@ then extracts image URLs from SSE stream.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, List, Optional
 
-from curl_cffi import requests as curl_requests
 from loguru import logger
 
 from .client import ChatGPTClient, ChatOptions, ChatResult, BASE_URL
-from .retry import retry_call
-from .sse import ChatMessage, parse_sse_stream, extract_chat_messages
+from .retry import async_retry_call
+from .sse import ChatMessage, async_parse_sse_stream, async_extract_chat_messages
 
 
 @dataclass
@@ -33,13 +33,13 @@ class ImageResult:
 
 
 class ImageClient:
-    """Image generation client using chatgpt.com f/conversation."""
+    """Image generation client using chatgpt.com f/conversation (async)."""
 
     def __init__(self, chat_client: ChatGPTClient):
         self.client = chat_client
         self._last_conv_id = ""
 
-    def generate(self, prompt: str, model: str = "gpt-5-3",
+    async def generate(self, prompt: str, model: str = "gpt-5-3",
                  conversation_id: str = "", attachments: Optional[List[str]] = None,
                  system_hints: Optional[List[str]] = None) -> ImageResult:
         """Generate an image using f/conversation with picture_v2 system hint.
@@ -56,15 +56,16 @@ class ImageClient:
             system_hints: Override system hints (default ["picture_v2"]).
         """
         # 1. Bootstrap + chat-requirements
-        self.client.sentinel.bootstrap()
-        req_result = self.client.sentinel.get_chat_requirements()
+        await self.client.sentinel.bootstrap()
+        req_result = await self.client.sentinel.get_chat_requirements()
         chat_token = req_result.token
         if not chat_token:
             raise RuntimeError("Failed to get chat_requirements token")
 
         proof_token = ""
         if req_result.proofofwork_required and req_result.proofofwork_seed:
-            proof_token = self.client.sentinel.pow_config.solve_proof(
+            proof_token = await asyncio.to_thread(
+                self.client.sentinel.pow_config.solve_proof,
                 req_result.proofofwork_seed, req_result.proofofwork_difficulty,
                 self.client.sentinel.pow_max_iter,
             )
@@ -78,13 +79,13 @@ class ImageClient:
             system_hints=hints,
             attachments=attachments or [],
         )
-        conduit_token = self.client.prepare_fchat(chat_token, proof_token, opts)
+        conduit_token = await self.client.prepare_fchat(chat_token, proof_token, opts)
 
         # 3. Stream f/conversation
         result = ImageResult()
         asset_pointer = ""
 
-        for msg in self.client.stream_fchat(chat_token, proof_token, conduit_token, opts):
+        async for msg in self.client.stream_fchat(chat_token, proof_token, conduit_token, opts):
             if msg.conversation_id:
                 result.conversation_id = msg.conversation_id
                 self._last_conv_id = msg.conversation_id
@@ -102,7 +103,7 @@ class ImageClient:
         # Image generation is asynchronous: the tool message with asset_pointer
         # may not appear until the image is fully rendered.
         if result.conversation_id and not result.image_url:
-            polled_url, polled_ap = self._poll_for_image(
+            polled_url, polled_ap = await self._poll_for_image(
                 result.conversation_id, result.message_id, asset_pointer,
                 max_wait=300,
             )
@@ -115,7 +116,7 @@ class ImageClient:
         result.status = "success" if result.image_url else "failed"
         return result
 
-    def _poll_for_image(self, conversation_id: str, message_id: str,
+    async def _poll_for_image(self, conversation_id: str, message_id: str,
                         asset_pointer: str, max_wait: int = 60) -> tuple:
         """Poll /backend-api/conversation/{id} for completed image URL.
 
@@ -126,20 +127,19 @@ class ImageClient:
 
         path = f"/backend-api/conversation/{conversation_id}"
         deadline = time.time() + max_wait
+        session = self.client._get_session()
 
         while time.time() < deadline:
             try:
-                resp = retry_call(
-                    curl_requests.get,
+                resp = await async_retry_call(
+                    session.get,
                     f"{BASE_URL}{path}",
                     headers=self.client._common_headers(path),
-                    proxies=self.client._proxies,
-                    impersonate=self.client._impersonate,
                     timeout=30,
                     max_retries=2, delay=2.0, backoff=2.0, label="poll-image",
                 )
                 if resp.status_code != 200:
-                    time.sleep(3)
+                    await asyncio.sleep(3)
                     continue
 
                 data = resp.json()
@@ -173,7 +173,7 @@ class ImageClient:
                             ap = part.get("asset_pointer", "")
                             if ap:
                                 logger.debug(f"Poll: found asset_pointer={ap[:50]} in {content_type}")
-                                dl = self._download_asset(ap)
+                                dl = await self._download_asset(ap)
                                 if dl:
                                     logger.debug(f"Poll: download_url={dl[:80]}")
                                     return dl, ap
@@ -187,7 +187,7 @@ class ImageClient:
                                 return url, ap
                             ap = part.get("asset_pointer", "")
                             if ap and (ap.startswith("file-service://") or ap.startswith("sediment://")):
-                                dl_url = self._download_asset(ap)
+                                dl_url = await self._download_asset(ap)
                                 if dl_url:
                                     return dl_url, ap
                         elif isinstance(part, str):
@@ -202,7 +202,7 @@ class ImageClient:
                 async_status = data.get("async_status")
                 if async_status is not None and async_status != 0:
                     # Still generating, keep polling
-                    time.sleep(3)
+                    await asyncio.sleep(3)
                     continue
 
                 # If no async_status and no image found, check if all messages are done
@@ -222,11 +222,11 @@ class ImageClient:
             except Exception as e:
                 logger.debug(f"Poll error: {e}")
 
-            time.sleep(3)
+            await asyncio.sleep(3)
 
         return "", ""
 
-    def _download_asset(self, asset_pointer: str) -> str:
+    async def _download_asset(self, asset_pointer: str) -> str:
         """Get a signed download URL from asset_pointer.
 
         Two formats are supported:
@@ -252,12 +252,11 @@ class ImageClient:
             path = f"/backend-api/estuary/content?id={asset_pointer}"
 
         try:
-            resp = retry_call(
-                curl_requests.get,
+            session = self.client._get_session()
+            resp = await async_retry_call(
+                session.get,
                 f"{BASE_URL}{path}",
                 headers=self.client._common_headers(path),
-                proxies=self.client._proxies,
-                impersonate=self.client._impersonate,
                 timeout=30,
                 allow_redirects=False,
                 max_retries=2, delay=2.0, backoff=2.0, label="download-asset",

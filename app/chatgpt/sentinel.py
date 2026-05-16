@@ -9,6 +9,7 @@ Implements:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -18,10 +19,14 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from .retry import retry_call
-from .sse import SSEEvent, ChatMessage, parse_sse_stream, extract_chat_messages, stream_text_from_response
-from curl_cffi import requests as curl_requests
+from curl_cffi.requests import AsyncSession
 from loguru import logger
+
+from .retry import async_retry_call
+from .sse import (
+    SSEEvent, ChatMessage,
+    async_parse_sse_stream, async_extract_chat_messages, async_stream_text_from_response,
+)
 
 
 # ==================== POW Config ====================
@@ -104,7 +109,11 @@ class POWConfig:
         return "gAAAAAC" + data
 
     def solve_proof(self, seed: str, difficulty: str, max_iter: int = 500000) -> str:
-        """Solve proof-of-work challenge, return proof token (prefix gAAAAAB)."""
+        """Solve proof-of-work challenge, return proof token (prefix gAAAAAB).
+
+        NOTE: This is CPU-bound and stays sync. Callers should wrap it
+        with asyncio.to_thread() to avoid blocking the event loop.
+        """
         config = self._get_config_13()
         start_time = time.time()
         for i in range(max_iter):
@@ -162,6 +171,18 @@ class SentinelClient:
         self._cf_bm = ""
         self._cfuvid = ""
         self._bootstrapped = False
+        self._session: Optional[AsyncSession] = None
+
+    def _get_session(self) -> AsyncSession:
+        """Get or create the AsyncSession (must be called within a running event loop)."""
+        if self._session is None:
+            self._session = AsyncSession(
+                impersonate=self._impersonate,
+                proxies=self._proxies,
+                timeout=30,
+                max_clients=100,
+            )
+        return self._session
 
     def _common_headers(self, path: str = "") -> Dict[str, str]:
         return {
@@ -193,11 +214,12 @@ class SentinelClient:
             "X-Openai-Target-Route": path,
         }
 
-    def bootstrap(self) -> bool:
+    async def bootstrap(self) -> bool:
         """GET chatgpt.com to acquire __cf_bm, _cfuvid, oai-did cookies."""
         try:
-            resp = retry_call(
-                curl_requests.get,
+            session = self._get_session()
+            resp = await async_retry_call(
+                session.get,
                 f"{self.BASE_URL}/",
                 headers={
                     "User-Agent": self.user_agent,
@@ -212,9 +234,6 @@ class SentinelClient:
                     "Sec-Fetch-User": "?1",
                     "Upgrade-Insecure-Requests": "1",
                 },
-                proxies=self._proxies,
-                impersonate=self._impersonate,
-                timeout=30,
                 max_retries=3, delay=2.0, backoff=2.0, label="bootstrap",
             )
             self._cf_bm = resp.cookies.get("__cf_bm", "")
@@ -226,29 +245,27 @@ class SentinelClient:
             logger.warning(f"Bootstrap failed: {e}")
             return False
 
-    def _ensure_bootstrap(self) -> None:
+    async def _ensure_bootstrap(self) -> None:
         if not self._bootstrapped:
-            self.bootstrap()
+            await self.bootstrap()
 
     # ---------- Single-step chat-requirements ----------
 
-    def chat_requirements_single(self) -> ChatRequirementsResult:
+    async def chat_requirements_single(self) -> ChatRequirementsResult:
         """Single-step /backend-api/sentinel/chat-requirements."""
-        self._ensure_bootstrap()
+        await self._ensure_bootstrap()
         path = "/backend-api/sentinel/chat-requirements"
         req_token = self.pow_config.requirements_token()
 
-        resp = retry_call(
-            curl_requests.post,
+        session = self._get_session()
+        resp = await async_retry_call(
+            session.post,
             f"{self.BASE_URL}{path}",
             headers={
                 **self._common_headers(path),
                 "Content-Type": "application/json",
             },
             json={"p": req_token},
-            proxies=self._proxies,
-            impersonate=self._impersonate,
-            timeout=30,
             max_retries=3, delay=2.0, backoff=2.0, label="chat-req-single",
         )
         if resp.status_code >= 400:
@@ -267,30 +284,28 @@ class SentinelClient:
 
     # ---------- Two-step prepare + finalize ----------
 
-    def chat_requirements_prepare(self) -> Dict[str, Any]:
+    async def chat_requirements_prepare(self) -> Dict[str, Any]:
         """POST /backend-api/sentinel/chat-requirements/prepare."""
-        self._ensure_bootstrap()
+        await self._ensure_bootstrap()
         path = "/backend-api/sentinel/chat-requirements/prepare"
         req_token = self.pow_config.requirements_token()
 
-        resp = retry_call(
-            curl_requests.post,
+        session = self._get_session()
+        resp = await async_retry_call(
+            session.post,
             f"{self.BASE_URL}{path}",
             headers={
                 **self._common_headers(path),
                 "Content-Type": "application/json",
             },
             json={"p": req_token},
-            proxies=self._proxies,
-            impersonate=self._impersonate,
-            timeout=30,
             max_retries=3, delay=2.0, backoff=2.0, label="chat-req-prepare",
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"chat-requirements/prepare failed: {resp.status_code} {resp.text[:200]}")
         return resp.json()
 
-    def chat_requirements_finalize(self, prepare_token: str,
+    async def chat_requirements_finalize(self, prepare_token: str,
                                    proofofwork: str = "",
                                    turnstile_resp: str = "") -> Tuple[str, str]:
         """POST /backend-api/sentinel/chat-requirements/finalize.
@@ -303,17 +318,15 @@ class SentinelClient:
         if turnstile_resp:
             payload["turnstile"] = turnstile_resp
 
-        resp = retry_call(
-            curl_requests.post,
+        session = self._get_session()
+        resp = await async_retry_call(
+            session.post,
             f"{self.BASE_URL}{path}",
             headers={
                 **self._common_headers(path),
                 "Content-Type": "application/json",
             },
             json=payload,
-            proxies=self._proxies,
-            impersonate=self._impersonate,
-            timeout=30,
             max_retries=3, delay=2.0, backoff=2.0, label="chat-req-finalize",
         )
         if resp.status_code >= 400:
@@ -323,7 +336,7 @@ class SentinelClient:
 
     # ---------- Unified entry point (V2) ----------
 
-    def get_chat_requirements(self) -> ChatRequirementsResult:
+    async def get_chat_requirements(self) -> ChatRequirementsResult:
         """Get chat requirements token with 3-level fallback:
         1. Two-step (prepare + finalize) with Turnstile solver
         2. Turnstile VM solver (if configured)
@@ -331,7 +344,7 @@ class SentinelClient:
         """
         # Try two-step first
         try:
-            prep = self.chat_requirements_prepare()
+            prep = await self.chat_requirements_prepare()
             prep_token = prep.get("prepare_token", "")
             persona = prep.get("persona", "")
 
@@ -340,24 +353,23 @@ class SentinelClient:
             pow_seed = (prep.get("proofofwork") or {}).get("seed", "")
             pow_diff = (prep.get("proofofwork") or {}).get("difficulty", "")
 
-            # Solve POW if required
+            # Solve POW if required (CPU-bound, offload to thread)
             proof = ""
             if pow_required and pow_seed:
-                proof = self.pow_config.solve_proof(pow_seed, pow_diff, self.pow_max_iter)
+                proof = await asyncio.to_thread(
+                    self.pow_config.solve_proof, pow_seed, pow_diff, self.pow_max_iter)
                 logger.debug(f"POW solved: required={pow_required}, len={len(proof)}")
 
             # Solve Turnstile if required
             ts_resp = ""
             if ts_required:
-                ts_resp = self._solve_turnstile(prep.get("turnstile", {}).get("dx", ""))
+                ts_resp = await self._solve_turnstile(prep.get("turnstile", {}).get("dx", ""))
                 if not ts_resp:
                     logger.warning("Turnstile required but solver failed, falling back to single-step")
-                    # Do NOT return here — let execution fall through to single-step
-                    # fallback below so POW is also solved if needed.
                     raise RuntimeError("Turnstile solver failed, use single-step fallback")
 
             # Finalize
-            token, final_persona = self.chat_requirements_finalize(prep_token, proof, ts_resp)
+            token, final_persona = await self.chat_requirements_finalize(prep_token, proof, ts_resp)
             if token:
                 logger.info(f"Two-step chat-requirements OK, persona={final_persona or persona}")
                 return ChatRequirementsResult(
@@ -370,47 +382,62 @@ class SentinelClient:
             logger.warning(f"Two-step chat-requirements failed: {e}, falling back to single-step")
 
         # Fallback to single-step
-        result = self.chat_requirements_single()
+        result = await self.chat_requirements_single()
 
-        # Solve POW if required
+        # Solve POW if required (CPU-bound, offload to thread)
         if result.proofofwork_required and result.proofofwork_seed:
-            proof = self.pow_config.solve_proof(
-                result.proofofwork_seed, result.proofofwork_difficulty, self.pow_max_iter
-            )
+            proof = await asyncio.to_thread(
+                self.pow_config.solve_proof,
+                result.proofofwork_seed, result.proofofwork_difficulty, self.pow_max_iter)
             result.proof_token = proof
             logger.debug(f"Single-step POW solved, len={len(proof)}")
 
         return result
 
-    def _solve_turnstile(self, dx: str) -> str:
+    async def _solve_turnstile(self, dx: str) -> str:
         """Solve Turnstile challenge via external solver or VM."""
-        if self.turnstile_solver_url:
-            try:
-                resp = curl_requests.post(
-                    f"{self.turnstile_solver_url.rstrip('/')}/turnstile",
-                    json={"url": self.BASE_URL, "sitekey": dx},
-                    timeout=60,
+        if not self.turnstile_solver_url:
+            return ""
+
+        try:
+            session = self._get_session()
+            resp = await session.post(
+                f"{self.turnstile_solver_url.rstrip('/')}/turnstile",
+                json={"url": self.BASE_URL, "sitekey": dx},
+                timeout=60,
+            )
+            if resp.status_code != 200:
+                logger.warning("Turnstile solver returned non-200")
+                return ""
+
+            data = resp.json()
+            task_id = data.get("taskId")
+            if not task_id:
+                logger.warning("Turnstile solver returned no taskId")
+                return ""
+
+            # Poll for result
+            for _ in range(30):
+                await asyncio.sleep(2)
+                r = await session.get(
+                    f"{self.turnstile_solver_url.rstrip('/')}/result",
+                    params={"id": task_id},
+                    timeout=20,
                 )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    task_id = data.get("taskId")
-                    if task_id:
-                        # Poll for result
-                        for _ in range(30):
-                            time.sleep(2)
-                            r = curl_requests.get(
-                                f"{self.turnstile_solver_url.rstrip('/')}/result",
-                                params={"id": task_id},
-                                timeout=20,
-                            )
-                            if r.status_code == 200:
-                                rd = r.json()
-                                token = (rd.get("solution") or {}).get("token") or rd.get("solution", {}).get("value", "")
-                                if token and token != "CAPTCHA_FAIL":
-                                    return token
-                                if token == "CAPTCHA_FAIL":
-                                    break
-                logger.warning("Turnstile solver returned no valid token")
-            except Exception as e:
-                logger.warning(f"Turnstile solver error: {e}")
+                if r.status_code == 200:
+                    rd = r.json()
+                    token = (rd.get("solution") or {}).get("token") or rd.get("solution", {}).get("value", "")
+                    if token and token != "CAPTCHA_FAIL":
+                        return token
+                    if token == "CAPTCHA_FAIL":
+                        break
+            logger.warning("Turnstile solver returned no valid token")
+        except Exception as e:
+            logger.warning(f"Turnstile solver error: {e}")
         return ""
+
+    async def close(self) -> None:
+        """Close the underlying HTTP session."""
+        if self._session:
+            await self._session.close()
+            self._session = None

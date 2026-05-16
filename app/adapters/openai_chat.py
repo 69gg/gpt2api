@@ -7,7 +7,7 @@ import asyncio
 import json
 import time
 import uuid
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, AsyncGenerator, Dict, Generator, List, Optional
 
 from loguru import logger
 
@@ -88,15 +88,9 @@ class OpenAIChatAdapter:
             pow_max_iter=self.pow_max_iter,
         )
 
-    def _poll_conv_for_image(self, client: ChatGPTClient, conv_id: str,
+    async def _poll_conv_for_image(self, client: ChatGPTClient, conv_id: str,
                              msg_id: str, max_wait: int = 120) -> str:
-        """Poll /backend-api/conversation/{id} for async image generation.
-
-        When ChatGPT generates an image via regular chat, the SSE stream
-        only returns the revised prompt text. The actual image appears
-        asynchronously in the conversation. This method polls until the
-        image asset_pointer or URL is found.
-        """
+        """Poll /backend-api/conversation/{id} for async image generation."""
         from app.chatgpt.image import ImageClient
         from app.adapters.openai_image import _make_proxy_url
 
@@ -104,20 +98,16 @@ class OpenAIChatAdapter:
         img_client._last_conv_id = conv_id
 
         # Poll for image URL
-        image_url, _ = img_client._poll_for_image(conv_id, msg_id, "", max_wait=max_wait)
+        image_url, _ = await img_client._poll_for_image(conv_id, msg_id, "", max_wait=max_wait)
 
         if image_url and self.deployment_url:
             image_url = _make_proxy_url(image_url, self.deployment_url)
 
         return image_url
 
-    def _resolve_image_url(self, client: ChatGPTClient, conv_id: str,
+    async def _resolve_image_url(self, client: ChatGPTClient, conv_id: str,
                            msg_id: str, asset_pointer: str) -> str:
-        """Resolve an asset_pointer to a downloadable image URL.
-
-        Uses ImageClient._poll_for_image and _download_asset to get the
-        final signed URL, then optionally proxies it through deployment_url.
-        """
+        """Resolve an asset_pointer to a downloadable image URL."""
         from app.chatgpt.image import ImageClient
         from app.adapters.openai_image import _make_proxy_url
 
@@ -127,11 +117,11 @@ class OpenAIChatAdapter:
         image_url = ""
         # Try downloading the asset pointer directly
         if asset_pointer:
-            image_url = img_client._download_asset(asset_pointer)
+            image_url = await img_client._download_asset(asset_pointer)
 
         # If no URL from asset, try polling the conversation
         if not image_url and conv_id:
-            image_url, _ = img_client._poll_for_image(conv_id, msg_id, asset_pointer, max_wait=120)
+            image_url, _ = await img_client._poll_for_image(conv_id, msg_id, asset_pointer, max_wait=120)
 
         if image_url and self.deployment_url:
             image_url = _make_proxy_url(image_url, self.deployment_url)
@@ -170,7 +160,7 @@ class OpenAIChatAdapter:
 
         try:
             logger.info(f"ImageChat [{token.email}]: model={model} → upstream={upstream_model}, prompt={prompt[:60]}")
-            result = await asyncio.to_thread(img_client.generate, prompt, model=upstream_model)
+            result = await img_client.generate(prompt, model=upstream_model)
             logger.info(f"ImageChat [{token.email}]: status={result.status}, url={bool(result.image_url)}, asset={result.asset_pointer[:50] if result.asset_pointer else '-'}")
 
             if result.status != "success" or not result.image_url:
@@ -206,8 +196,8 @@ class OpenAIChatAdapter:
             logger.error(f"ImageChat [{token.email}]: FAILED reason={reason} err={e}")
             return {"error": "upstream_error", "message": error_str}
 
-    def _image_via_chat_stream(self, request: Dict[str, Any],
-                               token: "TokenInfo") -> Generator[str, None, None]:
+    async def _image_via_chat_stream(self, request: Dict[str, Any],
+                               token: "TokenInfo") -> AsyncGenerator[str, None]:
         """Handle image model streaming via ImageClient.generate."""
         from app.chatgpt.image import ImageClient
         from app.adapters.openai_image import _make_proxy_url
@@ -247,7 +237,7 @@ class OpenAIChatAdapter:
             yield f"data: {json.dumps(role_chunk)}\n\n"
 
             logger.info(f"ImageStream [{token.email}]: model={model} → upstream={upstream_model}, prompt={prompt[:60]}")
-            result = img_client.generate(prompt, model=upstream_model)
+            result = await img_client.generate(prompt, model=upstream_model)
             logger.info(f"ImageStream [{token.email}]: status={result.status}, url={bool(result.image_url)}")
 
             if result.status == "success" and result.image_url:
@@ -379,18 +369,18 @@ class OpenAIChatAdapter:
 
         try:
             logger.info(f"Chat [{token.email}]: model={model} → upstream={upstream_model}, msgs={len(messages)}, tools={bool(tools)}, image={is_image}")
-            result = client.chat(opts)
+            result = await client.chat(opts)
             logger.info(f"Chat [{token.email}]: finished, content_len={len(result.content)}, finish={result.finish_reason}, is_image={result.is_image}")
 
             content = result.content
             # If image was generated, resolve the image URL and append it.
             image_url = result.image_url
             if not image_url and result.asset_pointer:
-                image_url = self._resolve_image_url(
+                image_url = await self._resolve_image_url(
                     client, result.conversation_id, result.message_id, result.asset_pointer)
             if not image_url and result.conversation_id:
                 logger.info(f"Chat [{token.email}]: polling conversation for async image, conv={result.conversation_id}")
-                image_url = self._poll_conv_for_image(
+                image_url = await self._poll_conv_for_image(
                     client, result.conversation_id, result.message_id, max_wait=60)
             if image_url:
                 logger.info(f"Chat [{token.email}]: image resolved, url={image_url[:80]}")
@@ -440,7 +430,7 @@ class OpenAIChatAdapter:
             logger.error(f"Chat [{token.email}]: FAILED model={model} reason={reason} err={e}")
             return {"error": "upstream_error", "message": error_str}
 
-    def chat_completion_stream(self, request: Dict[str, Any]) -> Generator[str, None, None]:
+    async def chat_completion_stream(self, request: Dict[str, Any]) -> AsyncGenerator[str, None]:
         """Handle streaming chat completion request. Yields SSE-formatted chunks."""
         token = self.token_manager.get_available()
         if not token:
@@ -460,7 +450,8 @@ class OpenAIChatAdapter:
 
         # Delegate image models to ImageClient to avoid 413
         if _is_image_model(model) and not request.get("tools"):
-            yield from self._image_via_chat_stream(request, token)
+            async for chunk in self._image_via_chat_stream(request, token):
+                yield chunk
             return
 
         client = self._create_client(token)
@@ -528,7 +519,7 @@ class OpenAIChatAdapter:
             image_url_direct = ""
             content_emitted = False
 
-            for msg in client.chat_stream(opts):
+            async for msg in client.chat_stream(opts):
                 if msg.content:
                     if tool_parser:
                         # Once we've seen tool calls, discard remaining text
@@ -616,11 +607,11 @@ class OpenAIChatAdapter:
             image_url = image_url_direct
             if not image_url and has_image and asset_pointer:
                 logger.info(f"Stream [{token.email}]: resolving image asset={asset_pointer[:50]}")
-                image_url = self._resolve_image_url(client, conv_id, msg_id, asset_pointer)
+                image_url = await self._resolve_image_url(client, conv_id, msg_id, asset_pointer)
 
             if not image_url and conv_id:
                 logger.info(f"Stream [{token.email}]: polling conversation for async image, conv={conv_id}")
-                image_url = self._poll_conv_for_image(client, conv_id, msg_id)
+                image_url = await self._poll_conv_for_image(client, conv_id, msg_id)
 
             if image_url:
                 logger.info(f"Stream [{token.email}]: image resolved, url={image_url[:80]}")

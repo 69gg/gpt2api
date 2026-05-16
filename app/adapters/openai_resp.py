@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, AsyncGenerator, Dict, Generator, List, Optional
 
 from loguru import logger
 
@@ -107,7 +107,7 @@ class OpenAIResponseAdapter:
             },
         }
 
-    def create_response_stream(self, request: Dict[str, Any]) -> Generator[str, None, None]:
+    async def create_response_stream(self, request: Dict[str, Any]) -> AsyncGenerator[str, None]:
         """Handle streaming Responses API request."""
         model = request.get("model", "auto")
         input_data = request.get("input", [])
@@ -165,7 +165,7 @@ class OpenAIResponseAdapter:
         yield f"data: {json.dumps(content_start)}\n\n"
 
         # Stream text deltas
-        for chunk in self.chat_adapter.chat_completion_stream(chat_request):
+        async for chunk in self.chat_adapter.chat_completion_stream(chat_request):
             # Parse the chunk to extract content
             if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
                 try:
