@@ -22,6 +22,7 @@ from app.token_manager import TokenManager, TokenInfo, FailReason
 # Model mapping: API model name → chatgpt.com upstream model slug
 MODEL_MAP = {
     # Display IDs (dot notation)
+    "gpt-5.5": "gpt-5-5",
     "gpt-5.3": "gpt-5-3",
     "gpt-5.2": "gpt-5-2",
     "gpt-5.1": "gpt-5-1",
@@ -31,6 +32,7 @@ MODEL_MAP = {
     "auto": "auto",
     "research": "research",
     # Upstream slugs (pass-through)
+    "gpt-5-5": "gpt-5-5",
     "gpt-5-3": "gpt-5-3",
     "gpt-5-2": "gpt-5-2",
     "gpt-5-1": "gpt-5-1",
