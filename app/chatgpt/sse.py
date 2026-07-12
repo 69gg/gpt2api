@@ -7,9 +7,105 @@ and /backend-api/conversation endpoints.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Dict, Generator, Optional
+
+
+# ChatGPT inline citation/navlist markers are wrapped in private-use-area
+# control chars: "\ue200cite\ue202turn0finance0\ue201". They surface as stray
+# "citeturn0finance0" text in API output, so strip them. We also strip the
+# bare textual form in case the PUA delimiters are dropped upstream.
+_CITATION_SPAN_RE = re.compile("\ue200.*?\ue201", re.S)
+_CITATION_STRAY_RE = re.compile("[\ue200-\ue20f]")
+_CITATION_TEXT_RE = re.compile(
+    r"(?:cite|navlist|video)turn\d+[a-z]+\d+(?:turn\d+[a-z]+\d+)*"
+)
+
+
+def strip_citation_markers(text: str) -> str:
+    """Remove ChatGPT citation/navlist markers (PUA-delimited or bare text)."""
+    if not text:
+        return text
+    if "\ue200" in text:
+        text = _CITATION_SPAN_RE.sub("", text)
+        text = _CITATION_STRAY_RE.sub("", text)
+    text = _CITATION_TEXT_RE.sub("", text)
+    return text
+
+
+class CitationStripper:
+    """Stateful stripper for streamed deltas: drops PUA-delimited citation
+    markers even when a marker is split across chunks, plus the bare text form."""
+
+    # Maximum length of a bare-text citation token; keep this many trailing
+    # characters across chunk boundaries so a token split between deltas can
+    # still be matched and removed.
+    _TAIL_BUF_LEN = 32
+
+    def __init__(self) -> None:
+        self._in_marker = False
+        self._tail_buf = ""
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return chunk
+        # Step 1: Strip PUA-delimited markers, preserving state across chunks.
+        # The state only applies to the current chunk; any normal text before a
+        # split marker is already in _tail_buf from the previous call.
+        if self._in_marker or "\ue200" in chunk:
+            out = []
+            for ch in chunk:
+                if self._in_marker:
+                    if ch == "\ue201":
+                        self._in_marker = False
+                    continue
+                if ch == "\ue200":
+                    self._in_marker = True
+                    continue
+                if "\ue200" <= ch <= "\ue20f":
+                    continue
+                out.append(ch)
+            chunk = "".join(out)
+        # Step 2: Prepend any trailing tail from the previous chunk so a
+        # bare-text citation token split across chunk boundaries can be matched
+        # in full.  Downstream non-streaming code still calls
+        # strip_citation_markers() on the aggregated content as a final cleanup.
+        text = self._tail_buf + chunk
+        self._tail_buf = ""
+        text = _CITATION_TEXT_RE.sub("", text)
+        # Retain a trailing window in case a citation token was cut off at the
+        # end of this chunk.  Return everything before that window now.
+        if len(text) > self._TAIL_BUF_LEN:
+            self._tail_buf = text[-self._TAIL_BUF_LEN:]
+            return text[:-self._TAIL_BUF_LEN]
+        self._tail_buf = text
+        return ""
+
+    def flush(self) -> str:
+        """Return any remaining buffered text and reset the stripper."""
+        tail = self._tail_buf
+        self._tail_buf = ""
+        self._in_marker = False
+        if not tail:
+            return tail
+        return _CITATION_TEXT_RE.sub("", tail)
+
+
+def _term_finish(role: str, recipient: str, content_type: str) -> str:
+    """Return "stop" only when the current message is the user-visible
+    assistant answer. A bare {"p":"/message/status","v":"finished_successfully"}
+    patch carries no role, and the web-search/tool message reports
+    finished_successfully mid-stream too -- treating that as terminal would
+    cut the stream off before the answer is generated."""
+    if role not in ("assistant", ""):
+        return ""
+    if recipient not in ("all", ""):
+        return ""
+    if content_type not in ("text", "multimodal_text", ""):
+        return ""
+    return "stop"
 
 
 @dataclass
@@ -83,7 +179,6 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
     with full-message updates and JSON Patch incremental updates.
     """
     accumulators: Dict[str, Dict[str, Any]] = {}
-
     for event in events:
         if event.error:
             yield ChatMessage(finish_reason="error", content=event.error)
@@ -123,6 +218,36 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
                 )
             continue
 
+        # --- Batch JSON Patch with no top-level path ---
+        # Two forms, both used by the web-search / finance answer flow:
+        #   {"o": "patch", "v": [{"p": "/message/content/parts/0", "o": "append", "v": "..."}]}
+        #   {"v": [{"p": "/message/content/parts/0", "o": "append", "v": "..."}]}   (continuation)
+        # Non-content list items (e.g. search_result_group) are filtered by the path check below.
+        if "p" not in data and isinstance(data.get("v"), list):
+            conv_id = data.get("conversation_id", "")
+            msg_id = data.get("message_id", "")
+            key = f"{conv_id}:{msg_id}"
+            if key not in accumulators:
+                accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id, "role": "", "recipient": "", "content_type": ""}
+            for sub_patch in data["v"]:
+                if not isinstance(sub_patch, dict):
+                    continue
+                sub_val = sub_patch.get("v")
+                sub_path = sub_patch.get("p", "")
+                if isinstance(sub_val, str) and "/content/parts/" in sub_path:
+                    accumulators[key]["text"] += sub_val
+                    yield ChatMessage(
+                        message_id=msg_id, conversation_id=conv_id,
+                        role="assistant", content=sub_val,
+                    )
+                elif sub_path == "/message/status" and sub_val == "finished_successfully":
+                    acc = accumulators[key]
+                    yield ChatMessage(
+                        message_id=msg_id, conversation_id=conv_id,
+                        role="assistant", content="", finish_reason=_term_finish(acc.get("role", ""), acc.get("recipient", ""), acc.get("content_type", "")),
+                    )
+            continue
+
         # --- JSON Patch incremental delta ---
         # e.g. {"p": "/message/content/parts/0", "o": "append", "v": "Hello"}
         # Also handles {"p": "", "o": "add", "v": {"message": ...}} from delta_encoding
@@ -138,13 +263,18 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
                     conv_id = patch_value.get("conversation_id", "")
                     message_id = msg.get("id", "")
                     role = (msg.get("author") or {}).get("role", "")
-                    if role not in ("assistant", ""):
-                        continue
                     content_parts = (msg.get("content") or {}).get("parts", [])
                     model = msg.get("model", "")
                     key = f"{conv_id}:{message_id}"
                     if key not in accumulators:
-                        accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conv_id}
+                        accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conv_id, "role": "", "recipient": "", "content_type": ""}
+                    # Cache per-message context so later bare patches can tell
+                    # the visible answer from tool/web-search messages.
+                    accumulators[key]["role"] = role
+                    accumulators[key]["recipient"] = msg.get("recipient", "")
+                    accumulators[key]["content_type"] = (msg.get("content") or {}).get("content_type", "")
+                    if role not in ("assistant", ""):
+                        continue
 
                     # Build text content
                     text_parts = []
@@ -187,7 +317,7 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
             msg_id = data.get("message_id", "")
             key = f"{conv_id}:{msg_id}"
             if key not in accumulators:
-                accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id}
+                accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id, "role": "", "recipient": "", "content_type": ""}
             # Track accumulation for full-message fallback, but yield only the delta
             patch_path = data.get("p", "")
             if isinstance(patch_value, str):
@@ -201,12 +331,13 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
                         content=patch_value,
                     )
                 elif patch_path == "/message/status" and patch_value == "finished_successfully":
+                    acc = accumulators[key]
                     yield ChatMessage(
                         message_id=msg_id,
                         conversation_id=conv_id,
                         role="assistant",
                         content="",
-                        finish_reason="stop",
+                        finish_reason=_term_finish(acc.get("role", ""), acc.get("recipient", ""), acc.get("content_type", "")),
                     )
             elif isinstance(patch_value, list) and data.get("o") == "patch":
                 # Batch patch: v is a list of patch operations
@@ -223,12 +354,13 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
                                 content=sub_val,
                             )
                         elif sub_path == "/message/status" and sub_val == "finished_successfully":
+                            acc = accumulators[key]
                             yield ChatMessage(
                                 message_id=msg_id,
                                 conversation_id=conv_id,
                                 role="assistant",
                                 content="",
-                                finish_reason="stop",
+                                finish_reason=_term_finish(acc.get("role", ""), acc.get("recipient", ""), acc.get("content_type", "")),
                             )
             continue
 
@@ -240,7 +372,7 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
             msg_id = data.get("message_id", "")
             key = f"{conv_id}:{msg_id}"
             if key not in accumulators:
-                accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id}
+                accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id, "role": "", "recipient": "", "content_type": ""}
             if isinstance(patch_value, str):
                 accumulators[key]["text"] += patch_value
                 yield ChatMessage(
@@ -266,16 +398,19 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
         message_id = msg.get("id") or data.get("message_id", "")
         conversation_id = data.get("conversation_id", "")
         role = (msg.get("author") or {}).get("role", "")
+        # Cache per-message context in the accumulator so later bare patches
+        # (e.g. batch JSON Patch finish signals) use this message's role.
+        key = f"{conversation_id}:{message_id}"
+        if key not in accumulators:
+            accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conversation_id, "role": "", "recipient": "", "content_type": ""}
+        accumulators[key]["role"] = role
+        accumulators[key]["recipient"] = msg.get("recipient", "")
+        accumulators[key]["content_type"] = (msg.get("content") or {}).get("content_type", "")
         # Skip non-assistant messages (user/system echoes in SSE stream)
         if role not in ("assistant", ""):
             continue
         content_parts = (msg.get("content") or {}).get("parts", [])
         model = msg.get("model", "") or data.get("model", "")
-
-        # Update accumulator for this message so incremental deltas build on it
-        key = f"{conversation_id}:{message_id}"
-        if key not in accumulators:
-            accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conversation_id}
 
         # Detect replay: a full message update with status="finished_successfully"
         # and no prior delta content means this is a historical message being
@@ -398,7 +533,6 @@ async def async_parse_sse_stream(response) -> AsyncGenerator[SSEEvent, None]:
 async def async_extract_chat_messages(events) -> AsyncGenerator[ChatMessage, None]:
     """Async version of extract_chat_messages — iterates over async SSEEvent generator."""
     accumulators: Dict[str, Dict[str, Any]] = {}
-
     async for event in events:
         if event.error:
             yield ChatMessage(finish_reason="error", content=event.error)
@@ -434,6 +568,33 @@ async def async_extract_chat_messages(events) -> AsyncGenerator[ChatMessage, Non
                 )
             continue
 
+        # Batch JSON Patch with no top-level path (web-search / finance answer flow).
+        # Handles both {"o":"patch","v":[...]} and the {"v":[...]} continuation form.
+        if "p" not in data and isinstance(data.get("v"), list):
+            conv_id = data.get("conversation_id", "")
+            msg_id = data.get("message_id", "")
+            key = f"{conv_id}:{msg_id}"
+            if key not in accumulators:
+                accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id, "role": "", "recipient": "", "content_type": ""}
+            for sub_patch in data["v"]:
+                if not isinstance(sub_patch, dict):
+                    continue
+                sub_val = sub_patch.get("v")
+                sub_path = sub_patch.get("p", "")
+                if isinstance(sub_val, str) and "/content/parts/" in sub_path:
+                    accumulators[key]["text"] += sub_val
+                    yield ChatMessage(
+                        message_id=msg_id, conversation_id=conv_id,
+                        role="assistant", content=sub_val,
+                    )
+                elif sub_path == "/message/status" and sub_val == "finished_successfully":
+                    acc = accumulators[key]
+                    yield ChatMessage(
+                        message_id=msg_id, conversation_id=conv_id,
+                        role="assistant", content="", finish_reason=_term_finish(acc.get("role", ""), acc.get("recipient", ""), acc.get("content_type", "")),
+                    )
+            continue
+
         if "p" in data and "o" in data and "v" in data:
             patch_path = data.get("p", "")
             patch_op = data.get("o", "")
@@ -445,13 +606,18 @@ async def async_extract_chat_messages(events) -> AsyncGenerator[ChatMessage, Non
                     conv_id = patch_value.get("conversation_id", "")
                     message_id = msg.get("id", "")
                     role = (msg.get("author") or {}).get("role", "")
-                    if role not in ("assistant", ""):
-                        continue
                     content_parts = (msg.get("content") or {}).get("parts", [])
                     model = msg.get("model", "")
                     key = f"{conv_id}:{message_id}"
                     if key not in accumulators:
-                        accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conv_id}
+                        accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conv_id, "role": "", "recipient": "", "content_type": ""}
+                    # Cache per-message context so later bare patches can tell
+                    # the visible answer from tool/web-search messages.
+                    accumulators[key]["role"] = role
+                    accumulators[key]["recipient"] = msg.get("recipient", "")
+                    accumulators[key]["content_type"] = (msg.get("content") or {}).get("content_type", "")
+                    if role not in ("assistant", ""):
+                        continue
 
                     text_parts = []
                     is_image = False
@@ -491,7 +657,7 @@ async def async_extract_chat_messages(events) -> AsyncGenerator[ChatMessage, Non
             msg_id = data.get("message_id", "")
             key = f"{conv_id}:{msg_id}"
             if key not in accumulators:
-                accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id}
+                accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id, "role": "", "recipient": "", "content_type": ""}
             patch_path = data.get("p", "")
             if isinstance(patch_value, str):
                 if "parts/" in patch_path or patch_path == "":
@@ -503,12 +669,13 @@ async def async_extract_chat_messages(events) -> AsyncGenerator[ChatMessage, Non
                         content=patch_value,
                     )
                 elif patch_path == "/message/status" and patch_value == "finished_successfully":
+                    acc = accumulators[key]
                     yield ChatMessage(
                         message_id=msg_id,
                         conversation_id=conv_id,
                         role="assistant",
                         content="",
-                        finish_reason="stop",
+                        finish_reason=_term_finish(acc.get("role", ""), acc.get("recipient", ""), acc.get("content_type", "")),
                     )
             elif isinstance(patch_value, list) and data.get("o") == "patch":
                 for sub_patch in patch_value:
@@ -524,12 +691,13 @@ async def async_extract_chat_messages(events) -> AsyncGenerator[ChatMessage, Non
                                 content=sub_val,
                             )
                         elif sub_path == "/message/status" and sub_val == "finished_successfully":
+                            acc = accumulators[key]
                             yield ChatMessage(
                                 message_id=msg_id,
                                 conversation_id=conv_id,
                                 role="assistant",
                                 content="",
-                                finish_reason="stop",
+                                finish_reason=_term_finish(acc.get("role", ""), acc.get("recipient", ""), acc.get("content_type", "")),
                             )
             continue
 
@@ -539,7 +707,7 @@ async def async_extract_chat_messages(events) -> AsyncGenerator[ChatMessage, Non
             msg_id = data.get("message_id", "")
             key = f"{conv_id}:{msg_id}"
             if key not in accumulators:
-                accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id}
+                accumulators[key] = {"text": "", "message_id": msg_id, "conversation_id": conv_id, "role": "", "recipient": "", "content_type": ""}
             if isinstance(patch_value, str):
                 accumulators[key]["text"] += patch_value
                 yield ChatMessage(
@@ -563,14 +731,18 @@ async def async_extract_chat_messages(events) -> AsyncGenerator[ChatMessage, Non
         message_id = msg.get("id") or data.get("message_id", "")
         conversation_id = data.get("conversation_id", "")
         role = (msg.get("author") or {}).get("role", "")
+        # Cache per-message context in the accumulator so later bare patches
+        # (e.g. batch JSON Patch finish signals) use this message's role.
+        key = f"{conversation_id}:{message_id}"
+        if key not in accumulators:
+            accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conversation_id, "role": "", "recipient": "", "content_type": ""}
+        accumulators[key]["role"] = role
+        accumulators[key]["recipient"] = msg.get("recipient", "")
+        accumulators[key]["content_type"] = (msg.get("content") or {}).get("content_type", "")
         if role not in ("assistant", ""):
             continue
         content_parts = (msg.get("content") or {}).get("parts", [])
         model = msg.get("model", "") or data.get("model", "")
-
-        key = f"{conversation_id}:{message_id}"
-        if key not in accumulators:
-            accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conversation_id}
 
         had_prior_delta = bool(accumulators[key]["text"])
         msg_status = msg.get("status", "")
