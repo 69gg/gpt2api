@@ -263,13 +263,18 @@ def extract_chat_messages(events: Generator[SSEEvent, None, None]) -> Generator[
                     conv_id = patch_value.get("conversation_id", "")
                     message_id = msg.get("id", "")
                     role = (msg.get("author") or {}).get("role", "")
-                    if role not in ("assistant", ""):
-                        continue
                     content_parts = (msg.get("content") or {}).get("parts", [])
                     model = msg.get("model", "")
                     key = f"{conv_id}:{message_id}"
                     if key not in accumulators:
                         accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conv_id, "role": "", "recipient": "", "content_type": ""}
+                    # Cache per-message context so later bare patches can tell
+                    # the visible answer from tool/web-search messages.
+                    accumulators[key]["role"] = role
+                    accumulators[key]["recipient"] = msg.get("recipient", "")
+                    accumulators[key]["content_type"] = (msg.get("content") or {}).get("content_type", "")
+                    if role not in ("assistant", ""):
+                        continue
 
                     # Build text content
                     text_parts = []
@@ -601,13 +606,18 @@ async def async_extract_chat_messages(events) -> AsyncGenerator[ChatMessage, Non
                     conv_id = patch_value.get("conversation_id", "")
                     message_id = msg.get("id", "")
                     role = (msg.get("author") or {}).get("role", "")
-                    if role not in ("assistant", ""):
-                        continue
                     content_parts = (msg.get("content") or {}).get("parts", [])
                     model = msg.get("model", "")
                     key = f"{conv_id}:{message_id}"
                     if key not in accumulators:
                         accumulators[key] = {"text": "", "message_id": message_id, "conversation_id": conv_id, "role": "", "recipient": "", "content_type": ""}
+                    # Cache per-message context so later bare patches can tell
+                    # the visible answer from tool/web-search messages.
+                    accumulators[key]["role"] = role
+                    accumulators[key]["recipient"] = msg.get("recipient", "")
+                    accumulators[key]["content_type"] = (msg.get("content") or {}).get("content_type", "")
+                    if role not in ("assistant", ""):
+                        continue
 
                     text_parts = []
                     is_image = False
