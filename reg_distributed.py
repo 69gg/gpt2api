@@ -117,7 +117,7 @@ def push_to_all_instances(instances: List[str], token_data: dict,
 
 
 def register_one(email_provider: CFEmailProvider, proxies: dict | None,
-                  proxy: str, retry: int = 3, retry_delay: float = 10.0) -> dict | None:
+                  proxy: str, token_proxy: str = "", retry: int = 3, retry_delay: float = 10.0) -> dict | None:
     """Attempt to register a single account with retry."""
     for attempt in range(1, retry + 1):
         if _shutdown:
@@ -237,7 +237,7 @@ def main():
         _log(f"{label} Registering account...")
 
         token_data = register_one(
-            email_provider, reg_proxies, reg_proxy,
+            email_provider, reg_proxies, reg_proxy, token_proxy,
             retry=args.retry, retry_delay=args.retry_delay,
         )
 
