@@ -473,6 +473,12 @@ class ChatGPTClient:
         async for msg in self.stream_fchat(chat_token, proof_token, conduit_token, opts):
             if msg.content and not msg.is_image:
                 cleaned = stripper.feed(msg.content)
+                if msg.finish_reason:
+                    # Flush any trailing buffer that may have held a split
+                    # citation-token prefix once the stream terminates.
+                    tail = stripper.flush()
+                    if tail:
+                        cleaned += tail
                 if not cleaned and not msg.finish_reason:
                     # Entire delta was citation markup; nothing to emit
                     continue
